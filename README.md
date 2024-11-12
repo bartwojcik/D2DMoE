@@ -1,7 +1,7 @@
 
 Code for the paper:
 
-[Mikołaj Piórczyński, Filip Szatkowski, Klaudia Bałazy, and Bartosz Wójcik. "Exploiting transformer activation sparsity with dynamic inference."](https://arxiv.org/abs/2310.04361)
+[Filip Szatkowski, Bartosz Wójcik, Mikołaj Piórczyński, Simone Scardapane. "Exploiting Activation Sparsity with Dense to Dynamic-k Mixture-of-Experts Conversion"](https://arxiv.org/abs/2310.04361)
 
 (Accepted to NeurIPS 2024)
 
