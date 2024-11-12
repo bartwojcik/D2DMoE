@@ -189,7 +189,7 @@ def training_loop(args, tc):
         tc.accelerator.backward(loss)
         if args.clip_grad_norm is not None:
             total_norm = tc.accelerator.clip_grad_norm_(tc.model.parameters(), args.clip_grad_norm)
-            if tc.accelerator.is_main_process and total_norm is not None: # TODO check if total_norm=None indicates a bug??:
+            if tc.accelerator.is_main_process and total_norm is not None:  # TODO check if total_norm=None indicates a bug??:
                 tc.writer.add_scalar('Train/Gradient norm', total_norm.item(), global_step=tc.state.current_batch)
         tc.optimizer.step()
         if tc.scheduler is not None:
@@ -216,21 +216,30 @@ def final_eval(args, tc):
         final_scores = []
         final_losses = []
         final_flops = []
-        for k_to_use in args.k_to_test:
+        final_expert_average_costs = []
+        final_expert_utilization = []
+        final_total_experts = []
+        for k_to_use in args.k_to_eval:
             if tc.accelerator.is_main_process:
                 logging.info(f'Testing on testset for k={k_to_use}.')
             set_for_eval_with_gating(tc, k_to_use)
-            test_loss, test_acc, total_average_flops, expert_average_costs = online_evaluate_moe(tc.accelerator,
-                                                                                                 tc.model,
-                                                                                                 tc.test_loader,
-                                                                                                 tc.criterion_type,
-                                                                                                 cost_without_experts,
-                                                                                                 token_expert_costs)
+            test_loss, test_acc, total_average_flops, expert_average_costs, executed_expert_tokens, total_expert_tokens = online_evaluate_moe(
+                tc.accelerator,
+                tc.model,
+                tc.test_loader,
+                tc.criterion_type,
+                cost_without_experts,
+                token_expert_costs,
+                batches=args.test_batches,
+                return_counts=True)
             if tc.accelerator.is_main_process:
                 final_losses.append(test_loss)
                 final_scores.append(test_acc)
                 # benchmark model efficiency
                 final_flops.append(total_average_flops)
+                final_expert_average_costs.append(expert_average_costs)
+                final_expert_utilization.append(executed_expert_tokens)
+                final_total_experts.append(total_expert_tokens)
                 # log
                 tc.writer.add_scalar(f'Eval with k={k_to_use}/Test loss', test_loss,
                                      global_step=tc.state.current_batch)
@@ -238,18 +247,19 @@ def final_eval(args, tc):
                                      global_step=tc.state.current_batch)
                 tc.writer.add_scalar(f'Eval with k={k_to_use}/Model FLOPs', total_average_flops,
                                      global_step=tc.state.current_batch)
-
         if tc.accelerator.is_main_process:
             tc.writer.add_scalar('Eval/Model Params', model_params[''], global_step=tc.state.current_batch)
-
             final_results = {}
             final_results['args'] = args
             final_results['model_state'] = unwrapped_model.state_dict()
             final_results['test_losses'] = final_losses
-            final_results['hyperparam_values'] = args.k_to_test
+            final_results['hyperparam_values'] = args.k_to_eval
             final_results['final_scores'] = final_scores
             final_results['final_flops'] = final_flops
             final_results['model_params'] = dict(model_params)
+            final_results['expert_average_costs'] = final_expert_average_costs
+            final_results['expert_utilization'] = final_expert_utilization
+            final_results['total_experts_used'] = final_total_experts
             save_final(args, tc.final_path, final_results)
 
 

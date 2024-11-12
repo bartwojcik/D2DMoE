@@ -4,8 +4,15 @@ from typing import Dict, List
 
 import torch
 from omegaconf import OmegaConf
+from torch import nn
+from torchvision.ops import MLP as TorchvisionMLP
+from transformers.activations import GELUActivation, PytorchGELUTanh
+from transformers.models.bert.modeling_bert import BertIntermediate
+from transformers.models.gemma.modeling_gemma import GemmaMLP
 
-from architectures.moe.dsti import find_activations, replace_with_relu
+from architectures.gpt import MLP as GPTMLP
+from architectures.moe.dsti import SimpleMLP, find_relu_activations
+from architectures.vit import MLP
 from common import INIT_NAME_MAP, get_default_args
 from train import (
     TrainingContext,
@@ -17,7 +24,18 @@ from train import (
     setup_optimization,
     setup_state,
 )
-from utils import Mixup, add_save_activations_hook, get_lrs, load_model, save_state
+from utils import (
+    Mixup,
+    add_save_activations_hook,
+    find_module_names,
+    get_lrs,
+    get_module_by_name,
+    get_module_name,
+    get_parent_module_name,
+    load_model,
+    save_state,
+    set_module_by_name,
+)
 
 
 class EnforceSparsityTrainingContext(TrainingContext):
@@ -25,18 +43,44 @@ class EnforceSparsityTrainingContext(TrainingContext):
     modules_inputs: Dict = None
     modules_outputs: Dict = None
     model_hook_handles: List = None
-    mha_modules_names: List = None
+
+
+def eligible_activation_filter(model: nn.Module, m: nn.Module):
+    # TODO handle cases when functional variant is used instead
+    m_name = get_module_name(model, m)
+    parent_module = get_module_by_name(model, get_parent_module_name(m_name))
+    if isinstance(m, (nn.ReLU, nn.GELU, GELUActivation, PytorchGELUTanh)) and isinstance(parent_module, (
+            MLP, TorchvisionMLP, SimpleMLP, GPTMLP, BertIntermediate, GemmaMLP)):
+        return True
+
+
+def find_activations(model, apply_to):
+    if apply_to == 'moe_eligible_only':
+        acts_to_sparsify = find_module_names(model, eligible_activation_filter)
+    elif apply_to == 'everywhere':
+        acts_to_sparsify = find_module_names(model, lambda _, m: isinstance(m, (
+        nn.ReLU, nn.GELU, GELUActivation, PytorchGELUTanh)))
+    else:
+        raise ValueError(f'Invalid apply_to argument value: {apply_to}')
+    return acts_to_sparsify
+
+
+def replace_with_relu(model, acts_to_replace):
+    for act_m_name in acts_to_replace:
+        logging.info(f'Replacing {act_m_name} with ReLU')
+        set_module_by_name(model, act_m_name, nn.ReLU())
+    return model
 
 
 def setup_model(args, tc):
-    logging.info('Setting up model')
     assert args.model_class == 'enforce_sparsity'
     model, base_args, _ = load_model(args, args.base_on, args.exp_id)
     model = tc.accelerator.prepare(model)
     activations_to_sparsify = find_activations(model, **args.model_args)
-    tc.mha_modules_names = find_activations(model, apply_to='mha_projections')
     if 'relu' in args.dsti_enforce_mode:
         model = replace_with_relu(model, activations_to_sparsify)
+        # TODO add "apply_to" argument to find_relu_activations
+        activations_to_sparsify.extend(find_relu_activations(model))
     logging.info(f'Modules selected for activation sparsification: {activations_to_sparsify}')
     tc.modules_inputs, tc.modules_outputs, tc.model_hook_handles = \
         add_save_activations_hook(model, activations_to_sparsify)
@@ -46,9 +90,6 @@ def setup_model(args, tc):
     tc.model = tc.accelerator.prepare(model)
     # make sure all parameters are being optimized
     tc.model.requires_grad_(True)
-    tc.sparsity_enforcement_mode = args.dsti_enforce_mode
-    tc.sparsity_enforcement_displacement = args.dsti_clamp_displacement
-    logging.info('Model set up')
 
 
 def square_hoyer(tensor, dim=-1, eps=1e-15):
@@ -70,7 +111,7 @@ def training_loop(args, tc):
             label_smoothing=mixup_smoothing, num_classes=unwrapped_model.number_of_classes)
     else:
         mixup_fn = None
-    while tc.state.current_batch <= tc.last_batch:
+    while tc.state.current_batch < tc.last_batch:
         # save model conditionally
         if tc.accelerator.is_main_process:
             now = datetime.now()
@@ -79,15 +120,13 @@ def training_loop(args, tc):
                 model_saved = datetime.now()
         # model evaluation
         in_training_eval(args, tc)
-
         tc.model.train()
-
+        tc.optimizer.zero_grad(set_to_none=True)
         # Account for gradient accumulation
-        cumulative_task_loss = 0.0
-        cumulative_sparsity_loss_ffn = 0.0
-        cumulative_sparsity_loss_mha = 0.0
-        cumulativte_loss = 0.0
-
+        cumulative_task_loss = 0
+        cumulative_sparsity_loss_ffn = 0
+        cumulative_sparsity_loss_attn = 0
+        cumulativte_total_loss = 0
         for _ in range(args.gradient_accumulation_steps):
             # batch preparation
             try:
@@ -102,131 +141,151 @@ def training_loop(args, tc):
             if len(y_pred.shape) == 3:
                 # For CE loss on sequences
                 y_pred = y_pred.transpose(1, 2)
-
             # get activations / pre-activations and compute sparsity loss
             sparsity_loss_ffn = 0.0
             sparse_activations_sum_ffn = 0
             total_activations_sum_ffn = 0
-
-            sparsity_loss_mha = 0.0
-            sparse_activations_sum_mha = 0
-            total_activations_sum_mha = 0
-
-            if args.dsti_enforce_schedule == 'linear':
-                dsti_enforce_weight_ffn = tc.state.current_batch / tc.last_batch * args.dsti_enforce_weight
-                if tc.accelerator.is_main_process and tc.state.current_batch in tc.eval_batch_list:
-                    tc.writer.add_scalar('Train/Enforce weight FFN', dsti_enforce_weight_ffn, global_step=tc.state.current_batch)
-                if args.dsti_enforce_weight_mha is None:
-                    dsti_enforce_weight_mha = dsti_enforce_weight_ffn
-                else:
-                    dsti_enforce_weight_mha = tc.state.current_batch / tc.last_batch * args.dsti_enforce_weight_mha
-                    if tc.accelerator.is_main_process and tc.state.current_batch in tc.eval_batch_list:
-                        tc.writer.add_scalar('Train/Enforce weight MHA', dsti_enforce_weight_mha, global_step=tc.state.current_batch)
-            
-            elif args.dsti_enforce_schedule is None:
-                dsti_enforce_weight_ffn = args.dsti_enforce_weight
-                if args.dsti_enforce_weight_mha is None:
-                    dsti_enforce_weight_mha = dsti_enforce_weight_ffn
-                else:
-                    dsti_enforce_weight_mha = args.dsti_enforce_weight_mha
-
+            total_num_outputs_ffn = 0
+            sparsity_loss_attn = 0.0
+            sparse_activations_sum_attn = 0
+            total_activations_sum_attn = 0
+            total_num_outputs_attn = 0
             # warning! inputs (e.g. pre-activations for gelu) are tuples, outputs (e.g. relu activations) are tensors
             if args.dsti_enforce_mode == 'gelu_preactivations_hoyer_clamped':
                 for module_name, preacts in tc.modules_inputs.items():
                     # get first input tensor from the input tuple
                     assert isinstance(preacts, tuple)
                     preacts = preacts[0]
-                    clamped_preactivations = preacts.clamp(min=args.dsti_clamp_displacement) - args.dsti_clamp_displacement
+                    clamped_preactivations = preacts.clamp(
+                        min=args.dsti_clamp_displacement) - args.dsti_clamp_displacement
                     sparsity_loss = square_hoyer(clamped_preactivations, dim=-1).mean()
                     sparse_activations_sum = (clamped_preactivations <= args.dsti_clamp_displacement).sum().item()
                     total_activations_sum = preacts.numel()
-                    if module_name in tc.mha_modules_names:
-                        sparsity_loss_mha += sparsity_loss
-                        sparse_activations_sum_mha += sparse_activations_sum
-                        total_activations_sum_mha += total_activations_sum
+                    if 'q_proj' in module_name or 'k_proj' in module_name or 'v_proj' in module_name or 'o_proj' in module_name:
+                        sparsity_loss_attn += sparsity_loss
+                        sparse_activations_sum_attn += sparse_activations_sum
+                        total_activations_sum_attn += total_activations_sum
+                        total_num_outputs_attn += 1
                     else:
                         sparsity_loss_ffn += sparsity_loss
                         sparse_activations_sum_ffn += sparse_activations_sum
                         total_activations_sum_ffn += total_activations_sum
-                sparsity_loss_mha /= len(tc.mha_modules_names)
-                sparsity_loss_ffn /= (len(tc.modules_inputs) - len(tc.mha_modules_names))
+                        total_num_outputs_ffn += 1
             elif args.dsti_enforce_mode == 'gelu_preactivations_clamped':
                 for module_name, preacts in tc.modules_inputs.items():
                     # get first input tensor from the input tuple
                     assert isinstance(preacts, tuple)
                     preacts = preacts[0]
-                    clamped_preactivations = preacts.clamp(min=args.dsti_clamp_displacement) - args.dsti_clamp_displacement
+                    clamped_preactivations = preacts.clamp(
+                        min=args.dsti_clamp_displacement) - args.dsti_clamp_displacement
                     sparsity_loss = clamped_preactivations.sum(dim=-1).mean()
                     sparse_activations_sum = (clamped_preactivations <= args.dsti_clamp_displacement).sum().item()
                     total_activations_sum = preacts.numel()
-                    if module_name in tc.mha_modules_names:
-                        sparsity_loss_mha += sparsity_loss
-                        sparse_activations_sum_mha += sparse_activations_sum
-                        total_activations_sum_mha += total_activations_sum
+                    if 'q_proj' in module_name or 'k_proj' in module_name or 'v_proj' in module_name or 'o_proj' in module_name:
+                        sparsity_loss_attn += sparsity_loss
+                        sparse_activations_sum_attn += sparse_activations_sum
+                        total_activations_sum_attn += total_activations_sum
+                        total_num_outputs_attn += 1
                     else:
                         sparsity_loss_ffn += sparsity_loss
                         sparse_activations_sum_ffn += sparse_activations_sum
                         total_activations_sum_ffn += total_activations_sum
-                sparsity_loss_mha /= len(tc.mha_modules_names)
-                sparsity_loss_ffn /= (len(tc.modules_inputs) - len(tc.mha_modules_names))
+                        total_num_outputs_ffn += 1
             elif args.dsti_enforce_mode == 'relu_hoyer':
                 for module_name, acts in tc.modules_outputs.items():
                     assert isinstance(acts, torch.Tensor)
                     sparsity_loss = square_hoyer(acts, dim=-1).mean()
                     sparse_activations_sum = (acts <= 0).sum().item()
                     total_activations_sum = acts.numel()
-                    if module_name in tc.mha_modules_names:
-                        sparsity_loss_mha += sparsity_loss
-                        sparse_activations_sum_mha += sparse_activations_sum
-                        total_activations_sum_mha += total_activations_sum
+                    if 'q_proj' in module_name or 'k_proj' in module_name or 'v_proj' in module_name or 'o_proj' in module_name:
+                        sparsity_loss_attn += sparsity_loss
+                        sparse_activations_sum_attn += sparse_activations_sum
+                        total_activations_sum_attn += total_activations_sum
+                        total_num_outputs_attn += 1
                     else:
                         sparsity_loss_ffn += sparsity_loss
                         sparse_activations_sum_ffn += sparse_activations_sum
                         total_activations_sum_ffn += total_activations_sum
-                sparsity_loss_mha /= len(tc.mha_modules_names)
-                sparsity_loss_ffn /= (len(tc.modules_inputs) - len(tc.mha_modules_names))
+                        total_num_outputs_ffn += 1
             elif args.dsti_enforce_mode == 'relu_l1':
                 for module_name, acts in tc.modules_outputs.items():
                     assert isinstance(acts, torch.Tensor)
                     sparsity_loss = acts.sum(dim=-1).mean()
                     sparse_activations_sum = (acts <= 0).sum().item()
                     total_activations_sum = acts.numel()
-                    if module_name in tc.mha_modules_names:
-                        sparsity_loss_mha += sparsity_loss
-                        sparse_activations_sum_mha += sparse_activations_sum
-                        total_activations_sum_mha += total_activations_sum
+                    if 'q_proj' in module_name or 'k_proj' in module_name or 'v_proj' in module_name or 'o_proj' in module_name:
+                        sparsity_loss_attn += sparsity_loss
+                        sparse_activations_sum_attn += sparse_activations_sum
+                        total_activations_sum_attn += total_activations_sum
+                        total_num_outputs_attn += 1
                     else:
                         sparsity_loss_ffn += sparsity_loss
                         sparse_activations_sum_ffn += sparse_activations_sum
                         total_activations_sum_ffn += total_activations_sum
-                sparsity_loss_mha /= len(tc.mha_modules_names)
-                sparsity_loss_ffn /= (len(tc.modules_inputs) - len(tc.mha_modules_names))
+                        total_num_outputs_ffn += 1
             else:
                 raise ValueError(f'{args.enforce_mode=}')
+            exact_sparsity = 0
+            approx_sparsity_10 = 0
+            approx_sparsity_100 = 0
+            approx_sparsity_1000 = 0
+            approx_sparsity_10000 = 0
+            for module_name, acts in tc.modules_outputs.items():
+                acts = acts.abs()
+                acts = acts.view(-1, acts.size(-1))
+                max_acts = acts.max(dim=-1).values.unsqueeze(1)
+                exact_sparsity += (acts == 0.).sum().item()
+                approx_sparsity_10 += (acts < max_acts / 10).sum().item()
+                approx_sparsity_100 += (acts < max_acts / 100).sum().item()
+                approx_sparsity_1000 += (acts < max_acts / 1000).sum().item()
+                approx_sparsity_10000 += (acts < max_acts / 10000).sum().item()
+            exact_sparsity /= (total_activations_sum_attn + total_activations_sum_ffn)
+            approx_sparsity_10 /= (total_activations_sum_attn + total_activations_sum_ffn)
+            approx_sparsity_100 /= (total_activations_sum_attn + total_activations_sum_ffn)
+            approx_sparsity_1000 /= (total_activations_sum_attn + total_activations_sum_ffn)
+            approx_sparsity_10000 /= (total_activations_sum_attn + total_activations_sum_ffn)
+            if total_num_outputs_attn > 0:
+                sparsity_loss_attn /= total_num_outputs_attn
+            sparsity_loss_ffn /= total_num_outputs_ffn
             # task loss
             task_loss = tc.criterion(y_pred, y)
-
-            # loss computation
-            loss = task_loss + dsti_enforce_weight_ffn * sparsity_loss_ffn + dsti_enforce_weight_mha * sparsity_loss_mha
-
+            if args.dsti_enforce_schedule == 'linear':
+                # main
+                dsti_enforce_weight = tc.state.current_batch / tc.last_batch * args.dsti_enforce_weight
+                if tc.accelerator.is_main_process and tc.state.current_batch in tc.eval_batch_list:
+                    tc.writer.add_scalar(f'Train/Enforce weight FFN', dsti_enforce_weight,
+                                         global_step=tc.state.current_batch)
+            elif args.dsti_enforce_schedule == 'linear_warmup':
+                max_weight_reach_batch = int(tc.last_batch / 2)
+                dsti_enforce_weight = min(tc.state.current_batch / max_weight_reach_batch,
+                                          1.0) * args.dsti_enforce_weight
+                if tc.accelerator.is_main_process and tc.state.current_batch in tc.eval_batch_list:
+                    tc.writer.add_scalar(f'Train/Enforce weight', dsti_enforce_weight,
+                                         global_step=tc.state.current_batch)
+                #
+            elif args.dsti_enforce_schedule is None:
+                dsti_enforce_weight = args.dsti_enforce_weight
+            else:
+                raise NotImplementedError()
             if args.gradient_accumulation_steps > 1:
-                loss = loss / args.gradient_accumulation_steps
+                task_loss = task_loss / args.gradient_accumulation_steps
+                sparsity_loss_ffn = sparsity_loss_ffn / args.gradient_accumulation_steps
+                sparsity_loss_attn = sparsity_loss_attn / args.gradient_accumulation_steps
+            # loss computation
+            loss = (task_loss +
+                    dsti_enforce_weight * sparsity_loss_ffn +
+                    dsti_enforce_weight * sparsity_loss_attn)
             tc.accelerator.backward(loss)
-
-            cumulativte_loss += loss.item()
+            cumulativte_total_loss += loss.item()
             cumulative_task_loss += task_loss.item()
-            cumulative_sparsity_loss_ffn += sparsity_loss_ffn.item()
-            cumulative_sparsity_loss_mha += sparsity_loss_mha.item()
-
+            cumulative_sparsity_loss_ffn += float(sparsity_loss_ffn)
+            cumulative_sparsity_loss_attn += float(sparsity_loss_attn)
         # gradient computation and training step
-        # TODO not sure if we should not do clipping inside gradient accumulation loop
         if args.clip_grad_norm is not None:
             total_norm = tc.accelerator.clip_grad_norm_(tc.model.parameters(), args.clip_grad_norm)
-            if tc.accelerator.is_main_process and total_norm is not None:  # TODO check if total_norm=None indicates a bug??
+            if tc.accelerator.is_main_process:
                 tc.writer.add_scalar('Train/Gradient norm', total_norm.item(), global_step=tc.state.current_batch)
         tc.optimizer.step()
-        tc.optimizer.zero_grad(set_to_none=True)
-
         if tc.scheduler is not None:
             # log LRs
             if tc.accelerator.is_main_process:
@@ -239,20 +298,31 @@ def training_loop(args, tc):
         # bookkeeping
         if tc.accelerator.is_main_process:
             tc.writer.add_scalar('Train/Task loss', cumulative_task_loss, global_step=tc.state.current_batch)
-            tc.writer.add_scalar('Train/Sparsity loss FFN', cumulative_sparsity_loss_ffn, global_step=tc.state.current_batch)
-            tc.writer.add_scalar('Train/Sparsity loss MHA', cumulative_sparsity_loss_mha, global_step=tc.state.current_batch)
-            tc.writer.add_scalar('Train/Loss', cumulativte_loss, global_step=tc.state.current_batch)
-            sparsity = (sparse_activations_sum_ffn + sparse_activations_sum_mha) / (
-                        total_activations_sum_ffn + total_activations_sum_mha)
+            tc.writer.add_scalar('Train/Sparsity loss FFN', cumulative_sparsity_loss_ffn,
+                                 global_step=tc.state.current_batch)
+            tc.writer.add_scalar('Train/Sparsity loss Attn', cumulative_sparsity_loss_attn,
+                                 global_step=tc.state.current_batch)
+            tc.writer.add_scalar('Train/Loss', cumulativte_total_loss, global_step=tc.state.current_batch)
+
             sparsity_ffn = sparse_activations_sum_ffn / total_activations_sum_ffn
-            sparsity_mha = sparse_activations_sum_mha / total_activations_sum_mha
-            tc.writer.add_scalar('Train/Sparsity', sparsity, global_step=tc.state.current_batch)
             tc.writer.add_scalar('Train/Sparsity FFN', sparsity_ffn, global_step=tc.state.current_batch)
-            tc.writer.add_scalar('Train/Sparsity MHA', sparsity_mha, global_step=tc.state.current_batch)
+            if total_num_outputs_attn > 0.:
+                sparsity_attn = sparse_activations_sum_attn / total_activations_sum_attn
+                tc.writer.add_scalar('Train/Sparsity Attn', sparsity_attn, global_step=tc.state.current_batch)
+                sparsity_total = (sparse_activations_sum_ffn + sparse_activations_sum_attn) / (
+                        total_activations_sum_ffn + total_activations_sum_attn)
+                tc.writer.add_scalar('Train/Sparsity total', sparsity_total, global_step=tc.state.current_batch)
 
-
+            tc.writer.add_scalar('Activation sparsity train/Exact', exact_sparsity, global_step=tc.state.current_batch)
+            tc.writer.add_scalar('Activation sparsity train/Approx 10', approx_sparsity_10,
+                                 global_step=tc.state.current_batch)
+            tc.writer.add_scalar('Activation sparsity train/Approx 100', approx_sparsity_100,
+                                 global_step=tc.state.current_batch)
+            tc.writer.add_scalar('Activation sparsity train/Approx 1000', approx_sparsity_1000,
+                                 global_step=tc.state.current_batch)
+            tc.writer.add_scalar('Activation sparsity train/Approx 10000', approx_sparsity_10000,
+                                 global_step=tc.state.current_batch)
         tc.state.current_batch += 1
-
 
 
 def train(args):
@@ -266,6 +336,8 @@ def train(args):
     )
     logging.info('Configured logging')
     tc = EnforceSparsityTrainingContext()
+    tc.sparsity_enforcement_mode = args.dsti_enforce_mode
+    tc.sparsity_enforcement_displacement = args.dsti_clamp_displacement
     setup_accelerator(args, tc)
     setup_files_and_logging(args, tc)
     setup_data(args, tc)

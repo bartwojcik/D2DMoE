@@ -2,14 +2,13 @@ import logging
 from collections import defaultdict
 from pathlib import Path
 
-import numpy as np
 import torch
 from accelerate import Accelerator, DistributedDataParallelKwargs
 from matplotlib import pyplot as plt
 from omegaconf import OmegaConf
 
-from datasets_config import DATASETS_NAME_MAP
-from utils import add_save_outputs_hook, configure_logging, find_module_names, get_loader, load_model
+from data_utils.data import DATASETS_NAME_MAP
+from utils import add_save_outputs_hook, find_module_names, get_loader, load_model
 from visualize.cost_vs_plot import FONT_SIZE
 
 
@@ -28,7 +27,7 @@ def get_default_args():
     return default_args
 
 
-def process_dataset(accelerator, model, data_loader, module_outputs):
+def process_dataset(model, data_loader, module_outputs):
     globally_sparse = defaultdict(lambda: 0)
     activations_total = defaultdict(lambda: 0)
     token_sparsity = defaultdict(list)
@@ -57,8 +56,7 @@ def setup_and_process(accelerator, args, model, run_args):
     unwrapped_model = accelerator.unwrap_model(model)
     activations = find_module_names(model, lambda _, m: isinstance(m, (torch.nn.ReLU)))
     module_outputs, hook_handles = add_save_outputs_hook(unwrapped_model, activations)
-    global_activation_stats, token_sparsity = process_dataset(accelerator,
-                                                              model,
+    global_activation_stats, token_sparsity = process_dataset(model,
                                                               dataloader,
                                                               module_outputs)
     return global_activation_stats, token_sparsity
@@ -83,23 +81,15 @@ def plot_sparsity_histogram(token_sparsities, bins=100):
     return fig, saved_args
 
 
-def plot_subblock_sparsities(layer_sparsity, subblock, title=None):
-    subblock_sparsity = [round(v, 4) for k, v in layer_sparsity.items() if subblock in k]
-    fig, ax = plt.subplots(figsize=(16, 12), facecolor='w', edgecolor='k')
-    ax.bar(range(len(subblock_sparsity)), subblock_sparsity)    
-    ax.hlines(np.mean(subblock_sparsity), 0, len(subblock_sparsity), colors='r', linestyles='dashed')
-    ax.set_xlabel('Layer', fontsize=FONT_SIZE)
-    ax.set_ylabel('Density', fontsize=FONT_SIZE)
-    ax.set_xticks(range(len(subblock_sparsity)))
-    ax.set_xticklabels(range(len(subblock_sparsity)))
-    ax.set_title(title)
-    ax.set_ylim(0, 100)
-    fig.set_tight_layout(True)
-    return fig
-
-
 def main(args):
-    configure_logging()
+    logging.basicConfig(
+        format=(
+            '[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] ' '%(message)s'
+        ),
+        level=logging.INFO,
+        handlers=[logging.StreamHandler()],
+        force=True,
+    )
     display_names = args.exp_names if args.display_names is None else args.display_names
     name_dict = {}
     for exp_name, display_name in zip(args.exp_names, display_names):
@@ -116,8 +106,6 @@ def main(args):
     for exp_name in args.exp_names:
         for exp_id in args.exp_ids:
             run_name = f'{exp_name}_{exp_id}'
-            output_run_dir = args.output_dir / f'{name_dict[exp_name]}'
-            output_run_dir.mkdir(parents=True, exist_ok=True)
             if accelerator.is_main_process:
                 logging.info(f'Processing for run: {run_name}')
             model, run_args, final_results = load_model(args, exp_name, exp_id)
@@ -128,14 +116,10 @@ def main(args):
             global_activation_stats, token_sparsity = setup_and_process(accelerator, args, model, run_args)
             for k, v in global_activation_stats.items():
                 logging.info(f'Global activation sparsity for module {k}: {v * 100}%')
-            for key in ['value', 'key', 'query', 'output', 'intermediate_act_fn']:
-                fig = plot_subblock_sparsities(global_activation_stats, key, title=key)
-                save_path = output_run_dir / f'sparsities_{key}.png'
-                fig.savefig(save_path)
-                plt.close(fig)
-                logging.info(f'Figure saved in {str(save_path)}')
             for k, v in token_sparsity.items():
                 fig, saved_args = plot_sparsity_histogram(v)
+                output_run_dir = args.output_dir / f'{name_dict[exp_name]}'
+                output_run_dir.mkdir(parents=True, exist_ok=True)
                 save_path = output_run_dir / f'sparsities_{k}.png'
                 args_save_path = output_run_dir / f'sparsities_{k}.pt'
                 fig.savefig(save_path)

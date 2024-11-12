@@ -1,25 +1,17 @@
-import sys
-
-import torch
-from transformers import BertPreTrainedModel
-
-from architectures.moe.moe_models import ffn_filter_condition_bert
-
-if 'conda' in sys.path[-1] and 'site-packages' in sys.path[-1] and '.local' in sys.path[-2] and 'site-packages' in \
-        sys.path[-2]:
-    print("Fixing sys.path")
-    sys.path[-2], sys.path[-1] = sys.path[-1], sys.path[-2]
-
 import logging
 from typing import List
 
 from omegaconf import OmegaConf
 from torch import nn
+from torchvision.models import VisionTransformer
+from transformers import BertPreTrainedModel
 
-from architectures.moe.moefication import replace_with_moes, split_original_parameters
-from architectures.vit import ffn_filter_condition as ffn_filter_condition_vit, VisionTransformer
-from torchvision.models.vision_transformer import VisionTransformer as TorchvisionViT
+from architectures.vit import VisionTransformer as CustomVisionTransformer
 from architectures.gpt import ffn_filter_condition as ffn_filter_condition_gpt, GPT
+from architectures.moe.moe_models import ffn_filter_condition_bert, ffn_filter_condition_gemma
+from architectures.moe.moefication import replace_with_moes, split_original_parameters
+from architectures.nlp import GemmaWrapper
+from architectures.vit import ffn_filter_condition as ffn_filter_condition_vit
 from common import get_default_args, INIT_NAME_MAP
 from train import TrainingContext, setup_accelerator, setup_data, setup_optimization, setup_files_and_logging, \
     setup_state, final_eval
@@ -35,12 +27,14 @@ def setup_model(args, tc):
     assert args.model_class == 'moefication'
     base_model, base_args, _ = load_model(args, args.base_on, args.exp_id)
     tc.orig_model = base_model
-    if isinstance(base_model, (VisionTransformer, TorchvisionViT)):
+    if isinstance(base_model, (VisionTransformer, CustomVisionTransformer)):
         ffn_filter_condition = ffn_filter_condition_vit
     elif isinstance(base_model, GPT):
         ffn_filter_condition = ffn_filter_condition_gpt
     elif isinstance(base_model, BertPreTrainedModel):
         ffn_filter_condition = ffn_filter_condition_bert
+    elif isinstance(base_model, GemmaWrapper):
+        ffn_filter_condition = ffn_filter_condition_gemma
     else:
         raise NotImplementedError(f'Unknown model type: {type(base_model)}')
     tc.model, tc.replaced_modules_list = replace_with_moes(base_model, **args.model_args,

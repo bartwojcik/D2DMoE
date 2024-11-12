@@ -121,7 +121,6 @@ class MetaAdamW(torch.optim.AdamW):
             if id(param) not in self.param_ids:
                 continue
             grad = grad if not maximize else -grad
-            state = self.state[param]
             # State initialization
             exp_avg = self.state[param]['exp_avg']
             exp_avg_sq = self.state[param]['exp_avg_sq']

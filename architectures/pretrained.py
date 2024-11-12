@@ -3,7 +3,7 @@ from functools import partial
 import torch
 import torchvision
 from torchvision.models import ViT_B_16_Weights, EfficientNet_V2_S_Weights, EfficientNet_B0_Weights, \
-    ConvNeXt_Tiny_Weights, Swin_V2_S_Weights
+    ConvNeXt_Tiny_Weights, Swin_V2_S_Weights, Swin_T_Weights
 
 
 def get_efficientnet_b0():
@@ -113,6 +113,32 @@ def get_vit_b_16():
 
 def get_swin_v2_s():
     model = torchvision.models.swin_v2_s(Swin_V2_S_Weights.IMAGENET1K_V1, progress=False)
+
+    def forward_generator(self, x):
+        for stage in self.features:
+            if isinstance(stage, torch.nn.Sequential):
+                for block in stage:
+                    x = block(x)
+                    x = yield x, None
+            else:
+                x = stage(x)
+                # x = yield x, None
+        x = self.norm(x)
+        x = self.permute(x)
+        x = self.avgpool(x)
+        x = self.flatten(x)
+        x = self.head(x)
+        _ = yield None, x
+
+    model.forward_generator = partial(forward_generator, model)
+    model.input_size = 256
+    model.input_channels = 3
+    model.number_of_classes = 1000
+    return model
+
+
+def get_swin_t():
+    model = torchvision.models.swin_t(Swin_T_Weights.IMAGENET1K_V1, progress=False)
 
     def forward_generator(self, x):
         for stage in self.features:

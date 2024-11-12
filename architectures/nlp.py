@@ -1,11 +1,14 @@
 import os
 from functools import partial
+from pathlib import Path
 
 import torch
 from transformers import (
     BertForSequenceClassification,
     DistilBertForSequenceClassification,
     RobertaForSequenceClassification,
+    GemmaConfig,
+    GemmaForCausalLM,
     apply_chunking_to_forward,
 )
 
@@ -190,15 +193,15 @@ def get_roberta(model_name_or_path, num_classes, max_seq_length):
 
 
 def get_gpt2(
-    model_name=None,
-    block_size=None,
-    n_layer=None,
-    n_head=None,
-    n_embd=None,
-    bias=None,
-    dropout=0.0,
-    meta_vocab_size=None,
-    activation=None,
+        model_name=None,
+        block_size=None,
+        n_layer=None,
+        n_head=None,
+        n_embd=None,
+        bias=None,
+        dropout=0.0,
+        meta_vocab_size=None,
+        activation=None,
 ):
     if model_name is not None:
         model = GPT.from_pretrained(model_name, override_args={"dropout": dropout})
@@ -225,7 +228,7 @@ def get_gpt2(
         device = x.device
         b, t = x.size()
         assert (
-            t <= self.config.block_size
+                t <= self.config.block_size
         ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
@@ -249,4 +252,62 @@ def get_gpt2(
     model.input_size = 256
     model.input_channels = 3
     model.number_of_classes = model.config.vocab_size
+    return model
+
+
+def get_gemma_2b(cache_dir=None):
+    return get_gemma('google/gemma-2b', cache_dir=cache_dir)
+
+
+class GemmaWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.gemma = model
+
+    def forward(self, x, return_gating_data=False):
+        input_ids = x["input_ids"]
+        attention_mask = x["attention_mask"]
+        if return_gating_data:
+            return self.gemma(input_ids=input_ids, attention_mask=attention_mask, return_gating_data=True)
+        else:
+            output = self.gemma(input_ids=input_ids, attention_mask=attention_mask)
+
+        if hasattr(output, 'logits'):
+            # Unwrap huggingface outputs if using standard model without wrapped forward
+            return output.logits
+        else:
+            return output
+
+
+def get_gemma(
+        model_name=None,
+        num_hidden_layers=None,
+        hidden_size=None,
+        intermediate_size=None,
+        num_attention_heads=None,
+        num_key_value_heads=None,
+        cache_dir=None
+):
+    if cache_dir is None:
+        cache_dir = os.environ["TRANSFORMERS_CACHE_DIR"]
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
+
+    if model_name is not None:
+        model = GemmaForCausalLM.from_pretrained(
+            model_name,
+            cache_dir=cache_dir,
+        )
+    else:
+        config = GemmaConfig.from_pretrained('google/gemma-2b')
+        config.num_hidden_layers = num_hidden_layers
+        config.hidden_size = hidden_size
+        config.intermediate_size = intermediate_size
+        config.num_attention_heads = num_attention_heads
+        config.num_key_value_heads = num_key_value_heads
+        model = GemmaForCausalLM(config)
+
+    model = GemmaWrapper(model)
+    # TODO check what has to go here
+    model.input_channels = 3
+    model.number_of_classes = model.gemma.config.vocab_size
     return model

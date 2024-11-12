@@ -1,4 +1,5 @@
 import logging
+import time
 from collections import defaultdict
 from typing import List, Tuple, Dict
 
@@ -18,12 +19,10 @@ def test_classification(accelerator: Accelerator,
                         model: torch.nn.Module,
                         data_loader: torch.utils.data.DataLoader,
                         criterion_class: torch.nn.Module,
-                        batches: int = 0,
-                        tc=None) -> Tuple[float, float]:
+                        batches: int = 0) -> Tuple[float, float]:
     criterion = criterion_class(reduction='sum')
     model.eval()
     with torch.inference_mode():
-        sparse_activations, total_activations = 0., 0.
         running_loss = 0.0
         correct, total = 0, 0
         for batch, (X, y) in enumerate(data_loader):
@@ -38,29 +37,8 @@ def test_classification(accelerator: Accelerator,
             correct += (y_pred_max == y).sum().item()
             # Again account for multi-dimensional targets
             total += y.numel()
-            if hasattr(tc, 'sparsity_enforcement_mode'):
-                if 'relu' in tc.sparsity_enforcement_mode:
-                    for module_name, acts in tc.modules_outputs.items():
-                        sparse_activations += (acts <= 0).sum().item()
-                        total_activations += acts.numel()
-                elif 'gelu' in tc.sparsity_enforcement_mode:
-                    displacement = tc.sparsity_enforcement_displacement
-                    for module_name, preacts in tc.modules_inputs.items():
-                        # get first input tensor from the input tuple
-                        assert isinstance(preacts, tuple)
-                        preacts = preacts[0]
-                        clamped_preactivations = preacts.clamp(min=displacement) - displacement
-                        sparse_activations += (clamped_preactivations <= 0).sum().item()
-                        total_activations += preacts.numel()
-                else:
-                    raise NotImplementedError()
-
             if batches > 0 and batch == batches - 1:
                 break
-    
-    if hasattr(tc, 'sparsity_enforcement_mode'):
-        tc.sparsity = sparse_activations / total_activations
-
     # loss, acc
     return running_loss / total, correct / total
 
@@ -111,31 +89,54 @@ def get_preds_earlyexiting(accelerator: Accelerator,
     return batch_head_preds, batch_labels
 
 
-def get_preds_moe(accelerator: Accelerator,
-                  model: torch.nn.Module,
-                  data_loader: torch.utils.data.DataLoader,
-                  batches: int = 0):
+# def get_preds_moe(accelerator: Accelerator,
+#                   model: torch.nn.Module,
+#                   data_loader: torch.utils.data.DataLoader,
+#                   batches: int = 0):
+#     model.eval()
+#     batch_outputs = []
+#     batch_labels = []
+#     batch_gating_data = defaultdict(list)
+#     with torch.inference_mode():
+#         for batch, (X, y) in enumerate(data_loader):
+#             output, gating_data = model(X, return_gating_data=True)
+#             # we select only the final routing decisions
+#             gating_data = {k: v[0] for k, v in gating_data.items()}
+#             output, y, gating_data = accelerator.gather_for_metrics((output, y, gating_data))
+#             batch_outputs.append(output.detach().cpu())
+#             batch_labels.append(y.detach().cpu())
+#             for k, v in gating_data.items():
+#                 batch_gating_data[k].append(v.detach().cpu())
+#             if batches > 0 and batch == batches - 1:
+#                 break
+#     batch_outputs = torch.cat(batch_outputs)
+#     batch_labels = torch.cat(batch_labels)
+#     for k in batch_gating_data.keys():
+#         batch_gating_data[k] = torch.cat(batch_gating_data[k])
+#     return batch_outputs, batch_labels, batch_gating_data
+
+
+def get_preds_avit(accelerator: Accelerator,
+                   model: torch.nn.Module,
+                   data_loader: torch.utils.data.DataLoader,
+                   batches: int = 0):
     model.eval()
     batch_outputs = []
     batch_labels = []
-    batch_gating_data = defaultdict(list)
+    batch_token_counts = []
     with torch.inference_mode():
         for batch, (X, y) in enumerate(data_loader):
-            output, gating_data = model(X, return_gating_data=True)
-            # we select only the final routing decisions
-            gating_data = {k: v[0] for k, v in gating_data.items()}
-            output, y, gating_data = accelerator.gather_for_metrics((output, y, gating_data))
+            output, token_counts = model(X, return_counts=True)
+            output, y, token_counts = accelerator.gather_for_metrics((output, y, token_counts))
             batch_outputs.append(output.detach().cpu())
             batch_labels.append(y.detach().cpu())
-            for k, v in gating_data.items():
-                batch_gating_data[k].append(v.detach().cpu())
+            batch_token_counts.append(token_counts.detach().cpu())
             if batches > 0 and batch == batches - 1:
                 break
     batch_outputs = torch.cat(batch_outputs)
     batch_labels = torch.cat(batch_labels)
-    for k in batch_gating_data.keys():
-        batch_gating_data[k] = torch.cat(batch_gating_data[k])
-    return batch_outputs, batch_labels, batch_gating_data
+    batch_token_counts = torch.cat(batch_token_counts)
+    return batch_outputs, batch_labels, batch_token_counts
 
 
 def online_evaluate_moe(accelerator: Accelerator,
@@ -144,13 +145,15 @@ def online_evaluate_moe(accelerator: Accelerator,
                         criterion_class: torch.nn.Module,
                         cost_without_experts,
                         token_expert_costs,
-                        batches: int = 0):
+                        batches: int = 0,
+                        return_counts: bool = False):
     criterion = criterion_class(reduction='sum')
     model.eval()
     running_loss = 0.0
     correct, total = 0, 0
     total_average_flops = cost_without_experts
-    moe_executed_tokens = {name: 0 for name in token_expert_costs.keys()}
+    executed_expert_tokens = {name: 0 for name in token_expert_costs.keys()}
+    total_expert_tokens = {name: 0 for name in token_expert_costs.keys()}
     expert_average_costs = {}
     with torch.inference_mode():
         for batch, (X, y) in enumerate(data_loader):
@@ -168,18 +171,68 @@ def online_evaluate_moe(accelerator: Accelerator,
             loss = criterion(y_pred, y)
             running_loss += loss.item()
             correct += (y_pred_max == y).sum().item()
-            total += y.numel() # use numel since targets can be batches of sequences
+            total += y.numel()  # use numel since targets can be batches of sequences
             for moe_name in token_expert_costs.keys():
-                moe_executed_tokens[moe_name] += (gating_data[moe_name] > 0.0).long().sum().item()
+                executed_expert_tokens[moe_name] += (gating_data[moe_name] > 0.0).long().sum().item()
+                total_expert_tokens[moe_name] += gating_data[moe_name].numel()
             if batches > 0 and batch == batches - 1:
                 break
     for moe_name, token_expert_cost in token_expert_costs.items():
-        expert_average_cost = moe_executed_tokens[moe_name] * token_expert_cost / total
+        expert_average_cost = executed_expert_tokens[moe_name] * token_expert_cost / total
         logging.info(f'Averaged FLOPs for MoE {moe_name}: {expert_average_cost}')
         expert_average_costs[moe_name] = expert_average_cost
         total_average_flops += expert_average_cost
     # loss, acc
-    return running_loss / total, correct / total, total_average_flops, expert_average_costs
+    if return_counts:
+        return running_loss / total, correct / total, total_average_flops, expert_average_costs, \
+            executed_expert_tokens, total_expert_tokens
+    else:
+        return running_loss / total, correct / total, total_average_flops, expert_average_costs
+
+
+
+def evaluate_model_throughput(model: torch.nn.Module,
+                              data_loader: torch.utils.data.DataLoader,
+                              criterion_class: torch.nn.Module,
+                              batches: int = 0,
+                              device='cpu',
+                              warmup_rounds: int = 3):
+    criterion = criterion_class(reduction='sum')
+    model.eval()
+    running_loss = torch.tensor(0.0, dtype=torch.double, device=device)
+    correct, total = torch.tensor(0.0, dtype=torch.long, device=device), 0
+    #
+    with torch.inference_mode():
+        # warmup
+        logging.info(f'Warming up the model for throughput measurements...')
+        for batch, (X, y) in enumerate(data_loader):
+            X, y = X.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            _y_pred = model(X)
+            if batch >= warmup_rounds:
+                break
+        if 'cuda' in device:
+            torch.cuda.synchronize()
+        logging.info(f'Model warmed-up, starting measurements...')
+        # torch.cuda.set_sync_debug_mode("error")
+        start = time.monotonic()
+        for batch, (X, y) in enumerate(data_loader):
+            total += y.size(0)
+            X, y = X.to(device, non_blocking=True), y.to(device, non_blocking=True)
+            y_pred = model(X)
+            y_pred_max = y_pred.argmax(dim=1)
+            loss = criterion(y_pred, y)
+            running_loss += loss.detach()
+            correct += (y_pred_max == y).sum().detach()
+            if batches > 0 and batch == batches - 1:
+                break
+        # torch.cuda.set_sync_debug_mode(0)
+        if 'cuda' in device:
+            torch.cuda.synchronize()
+        stop = time.monotonic()
+        duration = stop - start
+    #
+    dataset_size = len(data_loader.dataset)
+    return running_loss / total, correct / total, total / duration, duration, dataset_size
 
 
 def test_earlyexiting_classification(accelerator: Accelerator,
@@ -203,19 +256,35 @@ def average_earlyexiting_flops(head_costs: List, head_exit_counts: torch.Tensor)
     return average_cost
 
 
-def average_moe_flops(cost_without_experts, token_expert_costs, gating_data):
-    assert len(token_expert_costs) == gating_data.size(1), f'{len(token_expert_costs)=}\n{len(gating_data)=}'
-    total_average_flops = cost_without_experts
-    expert_average_costs = {}
-    for moe_name, token_expert_cost in token_expert_costs.items():
-        g_x = gating_data[moe_name]
-        # g_x should have a (batch_size, sequence_length, expert_num)
-        assert g_x.dim() == 3
-        expert_average_cost = (g_x > 0.0).long().sum().item() * token_expert_cost / g_x.size(0)
-        expert_average_costs.append(expert_average_cost)
-        logging.info(f'Averaged FLOPs for MoE {moe_name}: {expert_average_cost}')
-        total_average_flops += expert_average_cost
-    return total_average_flops, expert_average_costs
+# def average_moe_flops(cost_without_experts, token_expert_costs, gating_data):
+#     assert len(token_expert_costs) == gating_data.size(1), f'{len(token_expert_costs)=}\n{len(gating_data)=}'
+#     total_average_flops = cost_without_experts
+#     expert_average_costs = {}
+#     for moe_name, token_expert_cost in token_expert_costs.items():
+#         g_x = gating_data[moe_name]
+#         # g_x should have a (batch_size, sequence_length, expert_num)
+#         assert g_x.dim() == 3
+#         expert_average_cost = (g_x > 0.0).long().sum().item() * token_expert_cost / g_x.size(0)
+#         expert_average_costs.append(expert_average_cost)
+#         logging.info(f'Averaged FLOPs for MoE {moe_name}: {expert_average_cost}')
+#         total_average_flops += expert_average_cost
+#     return total_average_flops, expert_average_costs
+
+
+
+def average_avit_flops(constant_cost, mha_sequence_costs, mlp_token_cost, token_counts):
+    mha_sequence_costs = torch.tensor(mha_sequence_costs, dtype=torch.long)
+    # token counts contains the number of layers (i.e. entire blocks)
+    # executed by the model for each token
+    total_average_flops = constant_cost
+    for layer_i in range(token_counts.max().item()):
+        current_sequence_lengths = (token_counts > layer_i).to(torch.long).sum(dim=1).squeeze(-1)
+        mha_average_cost = torch.gather(mha_sequence_costs, dim=0,
+                                        index=current_sequence_lengths).sum().item() / token_counts.size(0)
+        mlp_average_cost = mlp_token_cost * (token_counts > layer_i).to(torch.long).sum().item() / token_counts.size(0)
+        total_average_flops += mha_average_cost + mlp_average_cost
+    logging.info(f'Total average model cost: {total_average_flops}')
+    return total_average_flops
 
 
 def evaluate_earlyexiting_classification(model: torch.nn.Module,
@@ -400,19 +469,14 @@ def evaluate_earlyexiting_ood_detection(head_id_preds: List[torch.Tensor],
     return results
 
 
-def benchmark(model: torch.nn.Module,
-              data_loader: torch.utils.data.DataLoader) -> Tuple[FlopCountAnalysis, Dict]:
+def benchmark_with_sample(model: torch.nn.Module,
+                          sample: torch.tensor) -> Tuple[FlopCountAnalysis, Dict]:
     model.eval()
     # workaround for the missing implementation of 'aten::_native_multi_head_attention' flop counter
     for m in model.modules():
         if isinstance(m, MultiheadAttention):
             m.train()
     #
-    X, _ = next(iter(data_loader))
-    if isinstance(X, dict):
-        sample = {k: v[:1] for k, v in X.items()}
-    else:
-        sample = X[:1]
     with torch.inference_mode():
         model_costs = flop_count(model, (sample,))
         param_count = parameter_count(model)
@@ -428,6 +492,16 @@ def benchmark(model: torch.nn.Module,
         for m in uncalled:
             logging.warning(f'Uncalled module: {m}')
     return model_costs, param_count
+
+
+def benchmark(model: torch.nn.Module,
+              data_loader: torch.utils.data.DataLoader) -> Tuple[FlopCountAnalysis, Dict]:
+    X, _ = next(iter(data_loader))
+    if isinstance(X, dict):
+        sample = {k: v[:1] for k, v in X.items()}
+    else:
+        sample = X[:1]
+    return benchmark_with_sample(model, sample)
 
 
 def benchmark_earlyexiting(model: torch.nn.Module,
@@ -464,7 +538,7 @@ def benchmark_earlyexiting(model: torch.nn.Module,
 
 def benchmark_moe(model: torch.nn.Module,
                   data_loader: torch.utils.data.DataLoader):
-    from architectures.moe.moe_layers import MoELayer, ExecuteAllExperts, ModuleBatchedExperts
+    from architectures.moe.moe_layers import MoELayer, ExecuteAllExperts, ModuleBatchedExperts, CustomKernelExperts
     model_costs, model_params = benchmark(model, data_loader)
     # find MoE modules and order them
     moe_module_names = find_module_names(model, lambda _, m: isinstance(m, MoELayer))
@@ -474,7 +548,8 @@ def benchmark_moe(model: torch.nn.Module,
         moe_module = get_module_by_name(model, moe_module_name)
         # find the experts module
         experts_names = find_module_names(moe_module,
-                                          lambda _, m: isinstance(m, (ExecuteAllExperts, ModuleBatchedExperts)))
+                                          lambda _, m: isinstance(m, (
+                                              ExecuteAllExperts, ModuleBatchedExperts, CustomKernelExperts)))
         assert len(experts_names) == 1, f'{len(experts_names)=}'
         experts_module_names[moe_module_name] = f'{moe_module_name}.{experts_names[0]}'
     # add hooks
@@ -496,23 +571,67 @@ def benchmark_moe(model: torch.nn.Module,
         experts_module = get_module_by_name(model, experts_name)
         # calculate cost of the gating network
         gating_cost = model_costs.by_module()[moe_name] - model_costs.by_module()[experts_name]
-        # calculate the cost of a single expert for a single sample
+        # calculate the cost of a single expert for a single token
         experts_input = experts_inputs[experts_name]
         assert experts_input[0].dim() == 2
         assert experts_input[1].dim() == 2
-        dummy_routing_tensor = torch.zeros_like(experts_input[1])
+        # experts_input[1] is the captured routing tensor
+        device, dtype = experts_input[1].device, experts_input[1].dtype
+        sizes = (1, experts_module.num_experts)
+        # create a dummy routing tensor for a single-token input
+        dummy_routing_tensor = torch.zeros(sizes, device=device, dtype=dtype)
+        # execute only a single expert for this input
         dummy_routing_tensor[0, 0] = 1.0
-        experts_input = (experts_input[0], dummy_routing_tensor)
-        with torch.cuda.amp.autocast(dtype=experts_input[1].dtype):
+        # experts_input[0] is the captured input into the experts layer (which should be a single sequence)
+        # experts_input[0][0] is the first captured token
+        experts_input = (experts_input[0][:1], dummy_routing_tensor)
+        with torch.cuda.amp.autocast(dtype=dtype):
             token_expert_cost = flop_count(experts_module, experts_input).total()
-        if isinstance(experts_module, ExecuteAllExperts):
+        if isinstance(experts_module, (ExecuteAllExperts, CustomKernelExperts)):
             # in this case all experts for each token in the sequence are executed
-            # so we divide by these two values
-            token_expert_cost /= experts_module.num_experts * dummy_routing_tensor.size(0)
+            # so we divide by these the number of experts
+            token_expert_cost /= experts_module.num_experts
         logging.info(
-            f'MoE {moe_name} single token-expert cost: {token_expert_cost}; sequence length: {experts_input[0].size(0)}')
+            f'MoE {moe_name} single token-expert cost: {token_expert_cost}; '
+            f'sequence length: {experts_inputs[experts_name][0].size(0)}')
         cost_without_experts -= model_costs.by_module()[moe_name] - gating_cost
         expert_costs[moe_name] = token_expert_cost
     remove_hooks(experts_handles)
     logging.info(f'Model cost without experts: {cost_without_experts}')
     return cost_without_experts, expert_costs, model_params
+
+
+def benchmark_avit(model: torch.nn.Module,
+                   data_loader: torch.utils.data.DataLoader):
+    X, _ = next(iter(data_loader))
+    device = X.device
+    del X
+    model_costs, model_params = benchmark(model, data_loader)
+    total_seq_len = model.num_total_tokens
+    constant_cost = model_costs.total()
+    # warning - assumes that all the MHA and MLP modules are the same!
+    mha_module_names = find_module_names(model, lambda _, m: isinstance(m, MultiheadAttention))
+    for mha_module_name in mha_module_names:
+        constant_cost -= model_costs.by_module()[mha_module_name]
+    # save MHA cost for each possible sequence length
+    mha_sequence_costs = [0]
+    mha_module = get_module_by_name(model, mha_module_name)
+    for i in range(total_seq_len):
+        seq_len = i + 1
+        dummy_input = torch.randn(1, seq_len, model.hidden_dim, device=device)
+        dummy_input = (dummy_input, dummy_input, dummy_input)
+        mha_cost_for_seq = flop_count(mha_module, dummy_input).total()
+        mha_sequence_costs.append(mha_cost_for_seq)
+    # save MLP cost for a single token
+    dummy_input = torch.randn(1, 1, model.hidden_dim, device=device)
+    mlp_module_names = find_module_names(model, lambda _, m: isinstance(m, MLP) or isinstance(m, CustomMLP))
+    for mlp_module_name in mlp_module_names:
+        constant_cost -= model_costs.by_module()[mlp_module_name]
+    mlp_module = get_module_by_name(model, mlp_module_name)
+    # save LN cost for a single token
+    ln_module_names = find_module_names(model, lambda _, m: isinstance(m, LayerNorm))
+    for ln_module_name in ln_module_names:
+        constant_cost -= model_costs.by_module()[ln_module_name]
+    ln_module = get_module_by_name(model, ln_module_name)
+    mlp_ln_token_cost = flop_count(mlp_module, dummy_input).total() + 2 * flop_count(ln_module, dummy_input).total()
+    return constant_cost, mha_sequence_costs, mlp_ln_token_cost, model_params

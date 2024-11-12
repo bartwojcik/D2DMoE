@@ -1,17 +1,20 @@
 import base64
 import hashlib
 import logging
+import math
 import numbers
 import os
 import warnings
 from collections import Counter
 from functools import partial, reduce
+from itertools import product
 from pathlib import Path
 from random import randint
-from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Optional, Set, Tuple, Union
+from typing import Any, Callable, Dict, FrozenSet, Iterator, List, Set, Tuple, Union
 
 import numpy as np
 import torch
+import triton
 import wandb
 from accelerate import Accelerator
 from accelerate.state import AcceleratorState
@@ -20,42 +23,10 @@ from fvcore.nn import FlopCountAnalysis
 from fvcore.nn.jit_handles import elementwise_flop_counter, get_shape
 from omegaconf import OmegaConf
 from tabulate import tabulate
-from torch import Tensor, inf, nn
-from transformers import BertPreTrainedModel
+from torch import nn
+from triton import language as tl
 
-from datasets_config import DATASETS_NAME_MAP
-
-
-def clip_by_norm_(tensors, max_norm: float, norm_type: float = 2.0):
-    max_norm = float(max_norm)
-    norm_type = float(norm_type)
-    if len(tensors) == 0:
-        return torch.tensor(0.)
-    if norm_type == inf:
-        norms = [t.detach().abs().max() for t in tensors]
-        total_norm = norms[0] if len(norms) == 1 else torch.max(torch.stack(norms))
-    else:
-        norms = [torch.norm(t, norm_type) for t in tensors]
-        total_norm = torch.norm(torch.stack([norm for norm in norms]), norm_type)
-    clip_coef = max_norm / (total_norm + 1e-6)
-    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
-    for t in tensors:
-        t.detach().mul_(clip_coef_clamped)
-    return total_norm
-
-
-class BCEWithLogitsLossWrapper(nn.BCEWithLogitsLoss):
-    def __init__(self, weight: Optional[Tensor] = None, size_average=None, reduce=None, reduction: str = 'mean',
-                 pos_weight: Optional[Tensor] = None):
-        super().__init__(weight, size_average, reduce, reduction, pos_weight)
-
-    def forward(self, input: Tensor, target: Tensor) -> Tensor:
-        if input.dim() - 1 == target.dim():
-            target = nn.functional.one_hot(target, num_classes=input.size(-1)).to(input.dtype)
-        return nn.functional.binary_cross_entropy_with_logits(input, target,
-                                                              self.weight,
-                                                              pos_weight=self.pos_weight,
-                                                              reduction=self.reduction)
+from data_utils.data import DATASETS_NAME_MAP
 
 
 # mixup code from:
@@ -269,21 +240,6 @@ class Mixup:
         return x, target
 
 
-def coefficient_of_variation(x, dim, unbiased):
-    return x.std(dim=dim, unbiased=unbiased) / x.mean(dim=dim).abs()
-
-
-def gumbel_sigmoid(x, tau=1.0, noise=True, eps=1e-10):
-    if noise:
-        u1, u2 = torch.rand_like(x), torch.rand_like(x)
-        g1, g2 = -torch.log(-torch.log(u1 + eps) + eps), -torch.log(-torch.log(u2 + eps) + eps)
-        x = x + g1 - g2
-    res = torch.sigmoid(x / tau)
-    res = ((res >= 0.5).to(x.dtype) - res).detach() + res
-    assert not torch.any(torch.isnan(res))
-    return res
-
-
 def get_lrs(optimizer):
     return [param_group['lr'] for param_group in optimizer.param_groups]
 
@@ -303,6 +259,12 @@ def find_module_names(model: nn.Module, filter: Callable[[nn.Module, nn.Module],
 def get_module_name(module: nn.Module, submodule: nn.Module):
     for name, m in module.named_modules():
         if m is submodule:
+            return name
+
+
+def get_parameter_name(module: nn.Module, parameter: nn.Parameter):
+    for name, p in module.named_parameters():
+        if p is parameter:
             return name
 
 
@@ -457,6 +419,23 @@ def count_scaled_dot_product_attention_ops(inputs: List[Any], _outputs: List[Any
     })
 
 
+def count_embedding_ops(inputs: List[Any], _outputs: List[Any]) -> int:
+    # We assume the cost of embedding matrix lookup is the cost of indexing
+    outputs_shape = get_shape(_outputs[0])
+    if len(outputs_shape) == 2:
+        # Positional embeddings
+        seq_len, d_model = outputs_shape
+        vocab_size = seq_len
+    elif len(outputs_shape) == 3:
+        # Token embeddings
+        _, seq_len, d_model = outputs_shape
+        vocab_size, _ = get_shape(inputs[0])
+    else:
+        raise ValueError()
+
+    return seq_len * d_model
+
+
 OP_HANDLERS = {
     # TODO verify correctness of these
     'aten::add': elementwise_flop_counter(0, 1),
@@ -489,6 +468,7 @@ OP_HANDLERS = {
     'aten::unflatten': elementwise_flop_counter(0, 0),
     'aten::mean': elementwise_flop_counter(1, 0),
     'aten::sum': elementwise_flop_counter(1, 0),
+    'aten::fill_': elementwise_flop_counter(1, 0),
     # TODO write a proper counter for these
     'aten::topk': elementwise_flop_counter(1, 1),
     'aten::scatter': elementwise_flop_counter(1, 1),
@@ -499,11 +479,13 @@ OP_HANDLERS = {
     # custom
     'aten::scaled_dot_product_attention': count_scaled_dot_product_attention_ops,
     # 'aten::_native_multi_head_attention': count_native_attention_ops,
+    'aten::embedding': count_embedding_ops,
 }
 
 
 def flop_count(model: torch.nn.Module, input) -> FlopCountAnalysis:
     return FlopCountAnalysis(model, input).set_op_handle(**OP_HANDLERS)
+
 
 def get_plain_loader(data: torch.utils.data.Dataset, batch_size: int, shuffle: bool = True, num_workers: int = 8,
                      pin: bool = True):
@@ -538,7 +520,11 @@ def make_hash_sha256(o: Union[Tuple, List, Dict, Set, FrozenSet]) -> str:
 
 def generate_run_name(args) -> Tuple[str, str]:
     # Properties from the config that are NOT to be included into hashing.
-    omitted_keys = ['exp_id', 'runs_dir', 'eval_points', 'eval_batches', 'test_batches', 'save_every', 'use_wandb', 'eval_thresholds', 'k_to_eval', 'k_to_test', 'dsti_tau_to_eval', 'dsti_tau_to_test', 'dsti_expert_selection_mode', 'num_workers', 'cpu']
+    # as a general rule, include those that do not affect training to avoid retraining models
+    # (warning! these might affect evaluation!)
+    omitted_keys = ['cpu', 'dsti_expert_selection_mode', 'dsti_tau_to_eval', 'eval_batches',
+                    'eval_points', 'eval_thresholds', 'exp_id', 'k_to_eval', 'num_workers', 'runs_dir', 'save_every',
+                    'save_test_activations', 'test_batch_size', 'test_batches', 'use_wandb']
     args_dict = OmegaConf.to_container(args, resolve=True)
     hashed_flags = {k: v for k, v in args_dict.items() if k not in omitted_keys and v is not None}
     short_hash = make_hash_sha256(hashed_flags)[:8]
@@ -560,7 +546,6 @@ def get_run_id(run_name: str):
 
 
 def load_state(accelerator: Accelerator, state_path: Path):
-    # TODO add wandb support?
     if state_path.exists() and state_path.is_dir():
         accelerator.load_state(state_path)
     elif accelerator.is_main_process:
@@ -568,38 +553,23 @@ def load_state(accelerator: Accelerator, state_path: Path):
 
 
 def save_state(accelerator: Accelerator, state_path: Path):
-    # TODO add wandb support?
     accelerator.save_state(state_path)
+    # accelerator.save_state(state_path, safe_serialization=False)
 
 
 def retrieve_final(args, run_name: str, device: Union[torch.device, str] = 'cpu'):
     final_path = args.runs_dir / run_name / 'final.pth'
     if final_path.exists() and final_path.is_file():
-        logging.info(f'Loading state for {run_name} from {str(final_path)}')
-        state = torch.load(final_path, map_location=device)
-    elif args.use_wandb:
-        logging.info(f"Loading state for {run_name} from W&B")
-        api = wandb.Api()
-        entity = os.environ['WANDB_ENTITY']
-        project = os.environ['WANDB_PROJECT']
-        retrieved_runs = api.runs(f'{entity}/{project}', filters={'display_name': run_name})
-        assert len(retrieved_runs) <= 1, f'retrieved_runs: {retrieved_runs}'
-        assert len(retrieved_runs) > 0, f'Run {run_name} not found'
-        run = retrieved_runs[0]
-        run.file('final.pth').download(root=str(final_path.parent), replace=True)
-        state = torch.load(final_path, map_location=device)
+        logging.info(f'Loading final state for {run_name} from {str(final_path)}')
+        final_state = torch.load(final_path, map_location=device)
     else:
         raise FileNotFoundError('Cannot find the final.pth file')
-    logging.info("Loaded state")
-    return state
+    return final_state
 
 
-def save_final(args, final_path, final_results):
+def save_final(_args, final_path, final_results):
     torch.save(final_results, final_path)
     logging.info(f'Saved final results to {str(final_path)}')
-    if args.use_wandb:
-        wandb.save(str(final_path))
-        logging.info('Saved final results to W&B')
 
 
 def create_model(model_class, model_args):
@@ -612,6 +582,8 @@ def load_model(args, exp_name: str, exp_id: str, device: Union[torch.device, str
     run_states = []
     run_args = []
     run_model_args = []
+    original_exp_name = exp_name
+    original_exp_id = exp_id
     while exp_name is not None:
         state = retrieve_final(args, f'{exp_name}_{exp_id}', device)
         arg = state['args']
@@ -632,21 +604,24 @@ def load_model(args, exp_name: str, exp_id: str, device: Union[torch.device, str
             model = model.to(device)
         elif arg.model_class == 'moefication':
             # TODO refactor this and instantiation of MoEfication models so that no duplication here is needed
-            from torchvision.models.vision_transformer import VisionTransformer as TorchvisionViT
-
+            from transformers import BertPreTrainedModel
             from architectures.gpt import GPT
             from architectures.gpt import ffn_filter_condition as ffn_filter_condition_gpt
-            from architectures.moe.moe_models import ffn_filter_condition_bert
+            from architectures.nlp import GemmaWrapper
+            from architectures.moe.moe_models import ffn_filter_condition_bert, ffn_filter_condition_gemma
             from architectures.moe.moefication import replace_with_moes
-            from architectures.vit import VisionTransformer
+            from architectures.vit import VisionTransformer as CustomVisionTransformer
             from architectures.vit import ffn_filter_condition as ffn_filter_condition_vit
+            from torchvision.models import VisionTransformer
 
-            if isinstance(model, (VisionTransformer, TorchvisionViT)):
+            if isinstance(model, (VisionTransformer, CustomVisionTransformer)):
                 ffn_filter_condition = ffn_filter_condition_vit
             elif isinstance(model, GPT):
                 ffn_filter_condition = ffn_filter_condition_gpt
             elif isinstance(model, BertPreTrainedModel):
                 ffn_filter_condition = ffn_filter_condition_bert
+            elif isinstance(model, GemmaWrapper):
+                ffn_filter_condition = ffn_filter_condition_gemma
             else:
                 raise NotImplementedError(f'Unknown model type: {type(model)}')
             model, _ = replace_with_moes(model, **model_arg, module_filter_contition=ffn_filter_condition)
@@ -658,32 +633,32 @@ def load_model(args, exp_name: str, exp_id: str, device: Union[torch.device, str
             model = model.to(device)
         elif arg.model_class == 'mha_rep_distill':
             # TODO refactor this so that no duplication here is needed
-            from torchvision.models.vision_transformer import VisionTransformer as TorchvisionViT
             from architectures.custom import simplify_mha
             from architectures.moe.dsti import replace_mha_projections
-            from architectures.vit import VisionTransformer
-            if isinstance(model, (VisionTransformer, TorchvisionViT)):
-                simplify_mha(model)
+            simplify_mha(model)
             model, _ = replace_mha_projections(model, **model_arg)
             if 'relu' in arg.dsti_enforce_mode:
-                from architectures.moe.dsti import find_activations, replace_with_relu
-                activations_to_sparsify = find_activations(model, 'mha_projections')
+                from architectures.moe.dsti import replace_with_relu
+                from architectures.moe.dsti import find_gelu_activations
+                activations_to_sparsify = find_gelu_activations(model, 'mha_projections')
                 model = replace_with_relu(model, activations_to_sparsify)
             model = model.to(device)
         elif arg.model_class == 'enforce_sparsity':
             # TODO refactor this so that no duplication here is needed
-            from architectures.moe.dsti import find_activations, replace_with_relu
-            activations_to_sparsify = find_activations(model, **model_arg)
             if 'relu' in arg.dsti_enforce_mode:
+                from architectures.moe.dsti import replace_with_relu
+                from architectures.moe.dsti import find_gelu_activations
+                activations_to_sparsify = find_gelu_activations(model, **model_arg)
                 model = replace_with_relu(model, activations_to_sparsify)
             model = model.to(device)
         elif arg.model_class == 'dsti_expert_split':
             # TODO refactor this so that no duplication here is needed
-            from architectures.moe.dsti import dsti_mlp_filter_condition
             from architectures.moe.moefication import replace_with_moes
+            from architectures.moe.dsti import dsti_mlp_filter_condition
             model, _ = replace_with_moes(model, **model_arg, module_filter_contition=dsti_mlp_filter_condition)
             model = model.to(device)
         elif arg.model_class == 'dsti_router':
+            # TODO refactor this so that no duplication here is needed
             from architectures.moe.moefication import add_routers
             add_routers(model, model_arg)
             model = model.to(device)
@@ -693,14 +668,8 @@ def load_model(args, exp_name: str, exp_id: str, device: Union[torch.device, str
     # state loading is only necessary for the model being loaded
     state_dict = run_states[0]['model_state']
     model.load_state_dict(state_dict)
+    logging.info(f'Model for {original_exp_name}_{original_exp_id} loaded successfully')
     return model, run_args[0], run_states[0]
-
-
-def load_run(args, run_name: str, device: Union[torch.device, str] = 'cpu'):
-    split_run_name = run_name.split('_')
-    exp_id = split_run_name[-1]
-    exp_name = '_'.join(split_run_name[:-1])
-    return load_model(args, exp_name, exp_id, device)
 
 
 def accelerate_launcher(function, num_processes=None, mixed_precision="no", use_port="29500"):
@@ -720,7 +689,7 @@ def accelerate_launcher(function, num_processes=None, mixed_precision="no", use_
             world_size=num_processes, master_addr="127.0.0.1", master_port=use_port, mixed_precision=mixed_precision
     ):
         launcher = PrepareForLaunch(function, distributed_type="MULTI_GPU")
-        print(f"Launching training on {num_processes} GPUs.")
+        print(f"Launching on {num_processes} GPUs.")
         try:
             start_processes(launcher, nprocs=num_processes, start_method="spawn")
             print("All processes exited")
@@ -728,8 +697,9 @@ def accelerate_launcher(function, num_processes=None, mixed_precision="no", use_
             print(f"ProcessRaisedException: {e}")
 
 
-def submit_job(executor, job_func, *job_args, num_gpus=1):
-    if isinstance(num_gpus, str) or 0 <= num_gpus <= 1:
+def submit_job(executor, job_func, *job_args, num_gpus=1, gpu_type=''):
+    executor.update_parameters(slurm_gpus_per_task=f'{gpu_type}{num_gpus}')
+    if 0 <= num_gpus <= 1:
         return executor.submit(job_func, *job_args)
     elif num_gpus > 1:
         # TODO check if port is available first (without TOCTOU, somehow)
@@ -737,17 +707,6 @@ def submit_job(executor, job_func, *job_args, num_gpus=1):
         print(f'Choosing random port for accelerate multi-gpu: {distributed_port}')
         job_partial = partial(job_func, *job_args)
         return executor.submit(accelerate_launcher, job_partial, num_processes=num_gpus, use_port=distributed_port)
-
-def configure_logging():
-    logging.basicConfig(
-        format=(
-            '[%(levelname)s:%(process)d %(module)s:%(lineno)d %(asctime)s] ' '%(message)s'
-        ),
-        level=logging.INFO,
-        handlers=[logging.StreamHandler()],
-        force=True,
-    )
-    logging.info('Configured logging')
 
 
 def summarize_experiments(exp_names, display_names, run_to_job_map):
@@ -757,5 +716,73 @@ def summarize_experiments(exp_names, display_names, run_to_job_map):
         job_ids = [job_id for run_name, job_id in run_to_job_map.items() if run_name.startswith(exp_name)]
         job_ids_str = ', '.join(job_ids) if job_ids else 'None'
         rows.append([exp_name, display_name, job_ids_str])
-
     print(tabulate(rows, headers=['Experiment Name', 'Display Name', 'SLURM JIDs'], tablefmt="grid"))
+
+
+def config_grid(hyperparam_dict, num_warps=4, num_stages=4, num_ctas=1):
+    configs = []
+    for t in product(*hyperparam_dict.values()):
+        meta_dict = {k: v for k, v in zip(hyperparam_dict.keys(), t)}
+        configs.append(triton.Config(meta_dict, num_warps, num_stages, num_ctas))
+    return configs
+
+
+@triton.jit
+def relu(x):
+    return tl.where(x >= 0, x, 0.0)
+
+
+@triton.jit
+def leaky_relu(x):
+    return tl.where(x >= 0, x, 0.01 * x)
+
+
+@triton.jit
+def tanh(x):
+    # Tanh is just a scaled sigmoid
+    return 2 * tl.sigmoid(2 * x) - 1
+
+
+_kAlpha = math.sqrt(2.0 / math.pi)
+
+
+@triton.jit
+def gelu_approx(x):
+    return 0.5 * x * (1 + tanh(_kAlpha * (x + 0.044715 * x * x * x)))
+
+
+@triton.jit
+def gelu(x):
+    return x * 0.5 * (1 + tl.math.erf(x / 2 ** (1 / 2)))
+
+
+@triton.jit
+def row_major(pid, n, block_n: tl.constexpr):
+    grid_n = tl.cdiv(n, block_n)
+    pid_m = pid // grid_n
+    pid_n = pid % grid_n
+    return pid_m, pid_n
+
+
+@triton.jit
+def grouped(pid,
+            m, n,
+            block_size_m: tl.constexpr, block_size_n: tl.constexpr,
+            group_size_m: tl.constexpr):
+    num_pid_m = tl.cdiv(m, block_size_m)
+    num_pid_n = tl.cdiv(n, block_size_n)
+    num_pid_in_group = group_size_m * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * group_size_m
+    group_size_m = min(num_pid_m - first_pid_m, group_size_m)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+    return pid_m, pid_n
+
+
+@triton.jit
+def column_major(pid, m, block_m: tl.constexpr):
+    grid_m = tl.cdiv(m, block_m)
+    pid_n = pid // grid_m
+    pid_m = pid % grid_m
+    return pid_m, pid_n

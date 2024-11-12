@@ -4,9 +4,11 @@ from copy import deepcopy
 from omegaconf import OmegaConf
 from torch import nn
 from torchvision.ops import MLP as TorchvisionMLP
+from transformers.activations import PytorchGELUTanh
+from transformers.models.gemma.modeling_gemma import GemmaMLP
 
-from architectures.vit import MLP
 from architectures.gpt import MLP as GPTMLP
+from architectures.vit import MLP
 from common import get_default_args, INIT_NAME_MAP
 from train import TrainingContext, setup_accelerator, setup_files_and_logging, setup_data, setup_optimization, \
     setup_state, training_loop, final_eval
@@ -17,7 +19,8 @@ from utils import load_model, find_module_names, get_module_name, get_module_by_
 def inside_ffn_filter(model: nn.Module, m: nn.Module):
     m_name = get_module_name(model, m)
     parent_module = get_module_by_name(model, get_parent_module_name(m_name))
-    if isinstance(m, nn.GELU) and isinstance(parent_module, (MLP, TorchvisionMLP, GPTMLP)):
+    # LLaMa uses SiLU
+    if isinstance(m, (nn.GELU, PytorchGELUTanh)) and isinstance(parent_module, (MLP, TorchvisionMLP, GPTMLP, GemmaMLP)):
         return True
 
 
@@ -26,7 +29,7 @@ def replace_with_relu(original_model, mode):
     if mode == 'ffns_only':
         acts_to_replace = find_module_names(model, inside_ffn_filter)
     elif mode == 'everywhere':
-        acts_to_replace = find_module_names(model, lambda _, m: isinstance(m, nn.GELU))
+        acts_to_replace = find_module_names(model, lambda _, m: isinstance(m, (nn.GELU, PytorchGELUTanh)))
     else:
         raise ValueError(f'Invalid relufication mode: {mode}')
     for act_m_name in acts_to_replace:

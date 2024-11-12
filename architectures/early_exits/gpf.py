@@ -1,4 +1,3 @@
-import logging
 from collections import defaultdict
 from math import sqrt
 from typing import Type, Set
@@ -24,7 +23,8 @@ class GPF(EarlyExitingBase):
         base_model_device = next(base_model.parameters()).device
         if hasattr(self._base_model, "input_sequences"):
             x_input = {
-                k: torch.ones((1, v), device=base_model_device, dtype=torch.int) for k, v in self._base_model.input_sequences.items()
+                k: torch.ones((1, v), device=base_model_device, dtype=torch.int) for k, v in
+                self._base_model.input_sequences.items()
             }
         else:
             input_size = self._base_model.input_size if hasattr(self._base_model, 'input_size') else 32

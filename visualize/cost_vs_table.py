@@ -5,14 +5,24 @@ import torch
 from accelerate import Accelerator
 from omegaconf import OmegaConf
 
-from datasets_config import DATASETS_NAME_MAP
-from eval import evaluate_earlyexiting_calibration, evaluate_earlyexiting_ood_detection, \
-    evaluate_calibration, evaluate_ood_detection, get_preds_earlyexiting, get_preds
-from utils import retrieve_final, load_model, get_loader
-from visualize.cost_vs_plot import PRETTY_NAME_DICT, compute_means_and_stds, get_default_args
+from data_utils.data import DATASETS_NAME_MAP
+from eval import (
+    evaluate_calibration,
+    evaluate_earlyexiting_calibration,
+    evaluate_earlyexiting_ood_detection,
+    evaluate_ood_detection,
+    get_preds,
+    get_preds_earlyexiting,
+)
+from utils import get_loader, load_model, retrieve_final
+from visualize.cost_vs_plot import (
+    PRETTY_NAME_DICT,
+    compute_means_and_stds,
+    get_default_args,
+)
 
 
-def generate_score_eff_table(f, core_stats, point_stats, ee_stats, name_dict, param):
+def generate_score_eff_table(f, core_stats, _point_stats, ee_stats, name_dict):
     cost_fractions = [0.25, 0.5, 0.75, 1.0, math.inf]
     # base_model_run_name = next(iter(core_stats.keys())) # TODO
     assert len(core_stats) > 0
@@ -69,7 +79,6 @@ def main(args):
         for exp_id in args.exp_ids:
             run_name = f'{exp_name}_{exp_id}'
             logging.info(f'Processing for: {run_name} ({args.mode})')
-            # TODO possibly split this into two scripts: one that generates outputs for both datasets and one that plots the data
             if args.mode == 'acc':
                 state = retrieve_final(args, run_name)
                 if 'thresholds' in state:
@@ -116,8 +125,9 @@ def main(args):
                     ood_preds, _ = get_preds(accelerator, model, ood_dataloader)
                     state.update(evaluate_ood_detection(id_preds, ood_preds))
                     core_stats[run_name] = state
-    core_stats, point_stats, ee_stats = compute_means_and_stds(args.exp_names, args.exp_ids, core_stats, point_stats,
-                                                               ee_stats)
+    core_stats, point_stats, ee_stats = compute_means_and_stds(
+        args.exp_names, args.exp_ids, core_stats, point_stats, ee_stats, mode=args.mode
+    )
     for exp_name, display_name in zip(args.exp_names, display_names):
         name_dict[exp_name] = display_name
     args.output_dir.mkdir(parents=True, exist_ok=True)

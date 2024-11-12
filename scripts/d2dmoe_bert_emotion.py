@@ -1,14 +1,3 @@
-import sys
-
-if (
-    "conda" in sys.path[-1]
-    and "site-packages" in sys.path[-1]
-    and ".local" in sys.path[-2]
-    and "site-packages" in sys.path[-2]
-):
-    print("Fixing sys.path")
-    sys.path[-2], sys.path[-1] = sys.path[-1], sys.path[-2]
-
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -16,20 +5,20 @@ from pathlib import Path
 import submitit
 
 from common import get_default_args
-from datasets_config import DATASET_TO_NUM_CLASSES, DATASET_TO_SEQUENCE_LENGTH
+from data_utils.data import DATASET_TO_NUM_CLASSES, DATASET_TO_SEQUENCE_LENGTH
 from methods.dynamic_sparsification.expert_split import train as dsti_expert_split
 from methods.dynamic_sparsification.sparse_finetuning import train as sparse_finetune
 from methods.dynamic_sparsification.train_routers import train as dsti_train_routers
 from methods.moefication.expert_split import train as moefication_expert_split
 from methods.moefication.train_routers import train as moefication_train_routers
 from train import train
-from utils import generate_run_name, submit_job, summarize_experiments
+from utils import generate_run_name, submit_job
 from visualize.cost_vs_plot import get_default_args as get_default_cost_plot_args
 from visualize.cost_vs_plot import main as cost_vs_plot
 
 DATASET = "emotion"
 MODEL_CLASS = "bert"
-MODEL_CHECKPOINT = "relu-bert-base-uncased"
+MODEL_CHECKPOINT = "mpiorczynski/relu-bert-base-uncased"
 TOKENIZER_NAME = "bert-base-uncased"
 NUM_CLASSES = DATASET_TO_NUM_CLASSES[DATASET]
 MAX_SEQ_LEN = DATASET_TO_SEQUENCE_LENGTH[DATASET]
@@ -37,9 +26,9 @@ MAX_SEQ_LEN = DATASET_TO_SEQUENCE_LENGTH[DATASET]
 def main():
     # ════════════════════════ submitit setup ════════════════════════ #
     job_name = "effbench"
-    account = None
+    account = "plgimpmoe-gpu-a100"
     qos = "normal"
-    partition = None
+    partition = "plgrid-gpu-a100"
     timeout = 60 * 24 * 2
     gpus_per_task = 1
     cpus_per_gpu = 16
@@ -54,7 +43,6 @@ def main():
         slurm_qos=qos,
         slurm_partition=partition,
         slurm_ntasks_per_node=1,
-        slurm_gpus_per_task=gpus_per_task,
         slurm_cpus_per_gpu=cpus_per_gpu,
         slurm_mem_per_cpu=mem_per_cpu,
     )
@@ -74,13 +62,9 @@ def main():
     common_args.loss_args.label_smoothing = 0.0
     common_args.optimizer_class = "adam"
     common_args.optimizer_args = {}
-    common_args.gradient_accumulation_steps = 1
     common_args.scheduler_class = "linear"
     common_args.scheduler_args = {'num_warmup_steps': 0}
     common_args.mixed_precision = None
-    common_args.save_every = 30
-    common_args.eval_batches = 0
-    common_args.batch_size = 32
 
     jobs = []
     run_to_job_map = {}
@@ -95,16 +79,16 @@ def main():
     finetuning_args.optimizer_args.weight_decay = 0.0
     finetuning_args.gradient_accumulation_steps = 1
     finetuning_args.batch_size = 64
-    finetuning_args.epochs = 5
-    finetuning_args.eval_points = 20
+    finetuning_args.epochs = 10
+    finetuning_args.eval_points = 40
     
     finetuning_exp_names = []
     for exp_id in exp_ids:
         args = deepcopy(finetuning_args)
         args.exp_id = exp_id
-        exp_name, run_name = generate_run_name(args)
-        job = submit_job(executor, train, args, num_gpus=gpus_per_task)
+        job = submit_job(executor, train, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
         jobs.append(job)
+        exp_name, run_name = generate_run_name(args)
         run_to_job_map[run_name] = job
 
     exp_names.append(exp_name)
@@ -115,8 +99,8 @@ def main():
 
     moefication_split_args = deepcopy(common_args)
     moefication_split_args.model_class = 'moefication'
-    moefication_split_args.model_args = {}
     moefication_split_args.epochs = 0
+    moefication_split_args.model_args = {}
     moefication_split_args.model_args.num_experts = 128
     moefication_split_args.model_args.experts_class = 'execute_all'
 
@@ -133,7 +117,7 @@ def main():
                 executor.update_parameters(slurm_additional_parameters={"dependency": dependency_str})
             else:
                 executor.update_parameters(slurm_additional_parameters={})
-            job = submit_job(executor, moefication_expert_split, args, num_gpus=gpus_per_task)
+            job = submit_job(executor, moefication_expert_split, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
             jobs.append(job)
             run_to_job_map[run_name] = job
 
@@ -147,15 +131,13 @@ def main():
     moefication_routing_args.model_class = 'moefication_router'
     moefication_routing_args.router_loss_type = 'bcewl'
     moefication_routing_args.epochs = 10
-    moefication_routing_args.eval_points = 5
-    moefication_routing_args.eval_batches = 30
     moefication_routing_args.batch_size = 64
     moefication_routing_args.optimizer_args.lr = 0.001
     moefication_routing_args.model_args = {}
     moefication_routing_args.model_args.depth = 2
     moefication_routing_args.model_args.width = 128
-    moefication_routing_args.k_to_eval = [2, 32, 64, 96]
-    moefication_routing_args.k_to_test = [1, 2, 4, 8, 16, 32, 64, 128]
+    moefication_routing_args.k_to_eval = [1, 2, 4, 8, 16, 32, 64, 128]
+    moefication_routing_args.eval_points = 21
 
     moefication_routing_exp_names = []
     for base_on_exp_name in moefication_expert_split_exp_names:
@@ -170,7 +152,7 @@ def main():
                 executor.update_parameters(slurm_additional_parameters={"dependency": dependency_str})
             else:
                 executor.update_parameters(slurm_additional_parameters={})
-            job = submit_job(executor, moefication_train_routers, args, num_gpus=gpus_per_task)
+            job = submit_job(executor, moefication_train_routers, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
             jobs.append(job)
             run_to_job_map[run_name] = job
         exp_names.append(exp_name)
@@ -190,7 +172,7 @@ def main():
         args = deepcopy(base_model_args)
         args.exp_id = exp_id
         exp_name, run_name = generate_run_name(args)
-        job = submit_job(executor, train, args, num_gpus=gpus_per_task)
+        job = submit_job(executor, train, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
         jobs.append(job)
         run_to_job_map[run_name] = job
 
@@ -198,12 +180,13 @@ def main():
 
     # ════════════════════════ sparse finetuning ════════════════════════ #
 
-    sparsification_args = deepcopy(finetuning_args)
+    sparsification_args = deepcopy(common_args)
+    sparsification_args.base_on = None
     sparsification_args.model_class = "enforce_sparsity"
-    sparsification_args.model_args = {}
-    sparsification_args.model_args.apply_to = "moe_eligible_only"
+    sparsification_args.model_args.model_name_or_path = MODEL_CHECKPOINT
     sparsification_args.dsti_enforce_mode = "relu_l1"
     sparsification_args.dsti_enforce_weight = 1e-4
+    sparsification_args.model_args.apply_to = "moe_eligible_only"
 
     sparsification_exp_names = []
     for exp_id in exp_ids:
@@ -217,7 +200,7 @@ def main():
             executor.update_parameters(slurm_additional_parameters={"dependency": dependency_str})
         else:
             executor.update_parameters(slurm_additional_parameters={})
-        job = submit_job(executor, sparse_finetune, args, num_gpus=gpus_per_task)
+        job = submit_job(executor, sparse_finetune, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
         jobs.append(job)
         run_to_job_map[run_name] = job
 
@@ -229,11 +212,10 @@ def main():
 
     dsti_split_args = deepcopy(common_args)
     dsti_split_args.model_class = "dsti_expert_split"
+    dsti_split_args.epochs = 0
     dsti_split_args.model_args = {}
     dsti_split_args.model_args.num_experts = 128
     dsti_split_args.model_args.experts_class = "execute_all"
-    dsti_split_args.epochs = 0
-    dsti_split_args.eval_points = 0
 
     dsti_split_exp_names = []
     for base_exp_name in sparsification_exp_names:
@@ -248,7 +230,7 @@ def main():
                 executor.update_parameters(slurm_additional_parameters={"dependency": dependency_str})
             else:
                 executor.update_parameters(slurm_additional_parameters={})
-            job = submit_job(executor, dsti_expert_split, args, num_gpus=gpus_per_task)
+            job = submit_job(executor, dsti_expert_split, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
             jobs.append(job)
             run_to_job_map[run_name] = job
         exp_names.append(exp_name)
@@ -265,20 +247,17 @@ def main():
     dsti_routing_args.model_args.activation = "relu"
     dsti_routing_args.model_args.output_activation = "abs"
     dsti_routing_args.router_loss_type = "mse"
-    dsti_routing_args.router_labels_norm = 1
-    dsti_routing_args.router_labels_layer = "intermediate"
     dsti_routing_args.epochs = 10
-    dsti_routing_args.eval_points = 5
-    dsti_routing_args.eval_batches = 30
-    dsti_routing_args.dsti_tau_to_eval = [0.25, 0.5, 0.75, 0.95]
-    dsti_routing_args.dsti_tau_to_test = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0]
+    dsti_routing_args.eval_points = 20
+    dsti_routing_args.dsti_tau_to_eval = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 1.0]
     dsti_routing_args.batch_size = 64
+    dsti_routing_args.gradient_accumulation_steps = 1
     dsti_routing_args.optimizer_args.lr = 0.001
 
     dsti_routing_exp_names = []
     for base_exp_name in dsti_split_exp_names:
         for exp_id in exp_ids:
-            args = deepcopy(dsti_routing_args)
+            args = deepcopy(dsti_split_args)
             args.exp_id = exp_id
             args.base_on = base_exp_name
             exp_name, run_name = generate_run_name(args)
@@ -288,7 +267,7 @@ def main():
                 executor.update_parameters(slurm_additional_parameters={"dependency": dependency_str})
             else:
                 executor.update_parameters(slurm_additional_parameters={})
-            job = submit_job(executor, dsti_train_routers, args, num_gpus=gpus_per_task)
+            job = submit_job(executor, dsti_train_routers, args, num_gpus=gpus_per_task, gpu_type=gpu_type)
             jobs.append(job)
             run_to_job_map[run_name] = job
         exp_names.append(exp_name)
@@ -297,8 +276,10 @@ def main():
 
     # ═════════════════════════════════════════════════════════ #
 
-    run_to_job_id = {k: v.job_id for k, v in run_to_job_map.items()}
-    summarize_experiments(exp_names, display_names, run_to_job_id)
+    print(f"Exp names: {exp_names}")
+    print(f"Display names: {display_names}")
+    print(f"SLURM JIDs: {[job.job_id for job in jobs]}")
+    print(f"Run to JID mapping: {[(k, v.job_id) for k, v in run_to_job_map.items()]}")
 
     # ════════════════════════ plot cost vs acc ════════════════════════ #
 
@@ -316,8 +297,8 @@ def main():
     plot_args.use_wandb = False
 
     dependency_str = f'afterany:{":".join(job.job_id for job in jobs)}'  # wait for all jobs to finish before plotting
-    executor.update_parameters(slurm_gpus_per_task=1, slurm_additional_parameters={"dependency": dependency_str})
-    submit_job(executor, cost_vs_plot, plot_args)
+    executor.update_parameters(slurm_additional_parameters={"dependency": dependency_str})
+    submit_job(executor, cost_vs_plot, plot_args, gpu_type=gpu_type)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 
+
 def ffn_filter_condition(_model: nn.Module, m: nn.Module):
     if isinstance(m, MLP):
         return True
@@ -63,6 +64,10 @@ class CausalSelfAttention(nn.Module):
                 ),
             )
 
+        # TODO this is placeholder for analysis - remove later
+        self.register_att_norms = False
+        self.att_norms = []
+
     def forward(self, x):
         (
             B,
@@ -100,12 +105,19 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+
         y = (
             y.transpose(1, 2).contiguous().view(B, T, C)
         )  # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
+
+        if self.register_att_norms:
+            y_by_head = y.view(B, T, self.n_head, -1)
+            att_norms = torch.linalg.norm(y_by_head, ord=2, dim=-1)
+            self.att_norms.append(att_norms.detach().cpu())
+
         return y
 
 
@@ -139,7 +151,17 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        # TODO fix this spaghetti with circular imports...
+        if isinstance(self.attn, CausalSelfAttention):
+            x = x + self.attn(self.ln_1(x))
+        else:
+            from architectures.custom import CustomMultiheadAttention
+            if isinstance(self.attn, CustomMultiheadAttention):
+                ln1_out = self.ln_1(x)
+                attn_out, _ = self.attn(query=ln1_out, key=ln1_out, value=ln1_out)
+                x = x + attn_out
+            else:
+                raise NotImplementedError()
         x = x + self.mlp(self.ln_2(x))
         return x
 

@@ -14,7 +14,7 @@ from omegaconf import OmegaConf
 from torch.utils.tensorboard import SummaryWriter
 
 from common import INIT_NAME_MAP, LOSS_NAME_MAP, OPTIMIZER_NAME_MAP, SCHEDULER_NAME_MAP, get_default_args
-from datasets_config import DATASETS_NAME_MAP
+from data_utils.data import DATASETS_NAME_MAP
 from eval import benchmark, test_classification
 from utils import (
     Mixup,
@@ -26,7 +26,7 @@ from utils import (
     load_state,
     save_final,
     save_state,
-    unfrozen_parameters,
+    unfrozen_parameters, load_model,
 )
 
 
@@ -58,6 +58,8 @@ class TrainingContext:
     criterion: Callable = None
     optimizer: torch.optim.Optimizer = None
     scheduler: Any = None
+    teacher_model: torch.nn.Module = None
+    distill_weight: float = None
     # files and logging
     state_path: PurePath = None
     final_path: PurePath = None
@@ -67,7 +69,11 @@ class TrainingContext:
 def setup_accelerator(args, tc):
     # do not change the split_batches argument
     # resuming a run with different resources and split_batches=False would cause the batches_per_epoch to be different
-    tc.accelerator = Accelerator(split_batches=True, mixed_precision=args.mixed_precision, cpu=args.cpu,
+    tc.accelerator = Accelerator(split_batches=True,
+                                 # overwrite the unintuitive behaviour of accelerate, see:
+                                 # https://discuss.huggingface.co/t/learning-rate-scheduler-distributed-training/30453
+                                 step_scheduler_with_optimizer=False,
+                                 mixed_precision=args.mixed_precision, cpu=args.cpu,
                                  # find_unused_parameters finds unused parameters when using DDP
                                  # but may affect performance negatively
                                  # sometimes it happens that somehow it works with this argument, but fails without it
@@ -90,20 +96,25 @@ def setup_data(args, tc):
     dataset_args = {} if args.dataset_args is None else args.dataset_args
     train_data, train_eval_data, test_data = DATASETS_NAME_MAP[args.dataset](**dataset_args)
     batch_size = args.batch_size
+    if args.test_batch_size is None:
+        test_batch_size = batch_size
+    else:
+        test_batch_size = args.test_batch_size
     tc.train_loader = get_loader(train_data, batch_size, tc.accelerator, num_workers=args.num_workers)
-    tc.train_eval_loader = get_loader(train_eval_data, batch_size, tc.accelerator, num_workers=args.num_workers)
-    tc.test_loader = get_loader(test_data, batch_size, tc.accelerator, num_workers=args.num_workers)
+    tc.train_eval_loader = get_loader(train_eval_data, test_batch_size, tc.accelerator, num_workers=args.num_workers)
+    tc.test_loader = get_loader(test_data, test_batch_size, tc.accelerator, num_workers=args.num_workers)
     if args.last_batch is None:
         batches_per_epoch = len(tc.train_loader)
-        tc.last_batch = args.epochs * batches_per_epoch - 1
+        tc.last_batch = math.ceil(args.epochs * batches_per_epoch - 1)
+        if tc.accelerator.is_main_process:
+            logging.info(f'{args.epochs=} {batches_per_epoch=} {tc.last_batch=}')
     else:
         tc.last_batch = args.last_batch
-        batches_per_epoch = None
+        if tc.accelerator.is_main_process:
+            logging.info(f'{tc.last_batch=}')
     tc.eval_batch_list = [
         round(x) for x in torch.linspace(0, tc.last_batch, steps=args.eval_points, device='cpu').tolist()
     ]
-    if tc.accelerator.is_main_process:
-        logging.info(f'{args.epochs=} {batches_per_epoch=} {tc.last_batch=}')
 
 
 def setup_optimization(args, tc):
@@ -127,8 +138,6 @@ def setup_optimization(args, tc):
         OPTIMIZER_NAME_MAP[args.optimizer_class](params, **optimizer_args))
     if args.scheduler_class is not None:
         scheduler_args = deepcopy(args.scheduler_args)
-        if 'T_0' in scheduler_args:
-            scheduler_args['T_0'] = int(math.ceil(scheduler_args['T_0'] * tc.last_batch))
         if 'patience' in scheduler_args:
             scheduler_args['patience'] = int(scheduler_args['patience'] * tc.last_batch)
         if args.scheduler_class == 'cosine':
@@ -136,6 +145,13 @@ def setup_optimization(args, tc):
         if args.scheduler_class in ['cosine_with_warmup', 'linear', 'inverse_sqrt']:
             scheduler_args['num_training_steps'] = tc.last_batch
         tc.scheduler = tc.accelerator.prepare(SCHEDULER_NAME_MAP[args.scheduler_class](tc.optimizer, **scheduler_args))
+    if args.distill_from is not None:
+        teacher_model, _, _ = load_model(args, args.distill_from, args.exp_id)
+        tc.teacher_model = tc.accelerator.prepare(teacher_model)
+        tc.teacher_model.eval()
+        tc.distill_weight = 1.0 if args.distill_weight is None else args.distill_weight
+        # TODO optionally parameterize the type of loss
+        tc.distill_criterion = torch.nn.KLDivLoss(log_target=True, reduction='batchmean')
 
 
 def setup_files_and_logging(args, tc):
@@ -180,16 +196,14 @@ def in_training_eval(args, tc):
                                                   tc.model,
                                                   tc.test_loader,
                                                   tc.criterion_type,
-                                                  batches=args.eval_batches,
-                                                  tc=tc)
+                                                  batches=args.eval_batches)
         if tc.accelerator.is_main_process and hasattr(tc, 'sparsity'):
             tc.writer.add_scalar('Eval/Test sparsity', tc.sparsity, global_step=tc.state.current_batch)
         train_loss, train_acc = test_classification(tc.accelerator,
                                                     tc.model,
                                                     tc.train_eval_loader,
                                                     tc.criterion_type,
-                                                    batches=args.eval_batches,
-                                                    tc=tc)
+                                                    batches=args.eval_batches)
         if tc.accelerator.is_main_process and hasattr(tc, 'sparsity'):
             tc.writer.add_scalar('Eval/Train sparsity', tc.sparsity, global_step=tc.state.current_batch)
         if tc.accelerator.is_main_process:
@@ -213,9 +227,7 @@ def training_loop(args, tc):
             label_smoothing=mixup_smoothing, num_classes=unwrapped_model.number_of_classes)
     else:
         mixup_fn = None
-
-    # data preparation
-    while tc.state.current_batch <= tc.last_batch:
+    while tc.state.current_batch < tc.last_batch:
         # save model conditionally
         if tc.accelerator.is_main_process:
             now = datetime.now()
@@ -224,9 +236,10 @@ def training_loop(args, tc):
                 model_saved = datetime.now()
         # model evaluation
         in_training_eval(args, tc)
-
+        tc.model.train()
+        tc.optimizer.zero_grad(set_to_none=True)
         # Account for gradient accumulation
-        running_loss = 0
+        running_loss, running_distill_loss = 0, 0
         for _ in range(args.gradient_accumulation_steps):
             # forward
             try:
@@ -236,32 +249,32 @@ def training_loop(args, tc):
                 X, y = next(train_iter)
             if mixup_fn is not None:
                 X, y = mixup_fn(X, y)
-
-            tc.model.train()
             y_pred = tc.model(X)
             # loss computation
             if len(y_pred.shape) == 3:
                 # For CE loss on sequences
-                y_pred = y_pred.transpose(1,2)
-
+                y_pred = y_pred.transpose(1, 2)
             loss = tc.criterion(y_pred, y)
+            if args.distill_from is not None:
+                y_teacher_logprobs = torch.log_softmax(tc.teacher_model(X), dim=-1)
+                distill_loss = tc.distill_criterion(torch.log_softmax(y_pred, dim=-1), y_teacher_logprobs.detach())
+                loss = loss + tc.distill_weight * distill_loss
             # rescale loss if doing gradient accumulation
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
-
+                if args.distill_from is not None:
+                    distill_loss = distill_loss / args.gradient_accumulation_steps
             # backward the loss
             tc.accelerator.backward(loss)
             running_loss += loss.item()
-
-        # TODO not sure if we should not do clipping inside gradient accumulation loop
+            if args.distill_from is not None:
+                running_distill_loss += distill_loss.item()
         if args.clip_grad_norm is not None:
             total_norm = tc.accelerator.clip_grad_norm_(tc.model.parameters(), args.clip_grad_norm)
-            if tc.accelerator.is_main_process and total_norm is not None: # TODO check if total_norm=None indicates a bug??
-                tc.writer.add_scalar('Train/Gradient norm', total_norm.item(), global_step=tc.state.current_batch)
+            if tc.accelerator.is_main_process:
+                tc.writer.add_scalar(f'Train/Gradient norm', total_norm.item(), global_step=tc.state.current_batch)
         # update parameters
         tc.optimizer.step()
-        tc.optimizer.zero_grad(set_to_none=True)
-
         if tc.scheduler is not None:
             # log LRs
             if tc.accelerator.is_main_process:
@@ -273,6 +286,8 @@ def training_loop(args, tc):
                 tc.scheduler.step()
         if tc.accelerator.is_main_process:
             tc.writer.add_scalar('Train/Loss', running_loss, global_step=tc.state.current_batch)
+            if args.distill_from is not None:
+                tc.writer.add_scalar('Train/Distill loss', running_distill_loss, global_step=tc.state.current_batch)
         # bookkeeping
         tc.state.current_batch += 1
 
@@ -282,10 +297,9 @@ def final_eval(args, tc):
         if tc.accelerator.is_main_process:
             save_state(tc.accelerator, tc.state_path)
         # test on testset
-        test_loss, test_acc = test_classification(tc.accelerator, tc.model, tc.test_loader, tc.criterion_type, args.test_batches, tc=tc)
+        test_loss, test_acc = test_classification(tc.accelerator, tc.model, tc.test_loader, tc.criterion_type,
+                                                  args.test_batches)
         if tc.accelerator.is_main_process:
-            if hasattr(tc, 'sparsity'):
-                tc.writer.add_scalar('Eval/Test sparsity', tc.sparsity, global_step=tc.state.current_batch)
             final_results = {}
             final_results['args'] = args
             unwrapped_model = tc.accelerator.unwrap_model(tc.model)
