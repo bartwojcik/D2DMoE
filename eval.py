@@ -150,7 +150,7 @@ def online_evaluate_moe(accelerator: Accelerator,
     criterion = criterion_class(reduction='sum')
     model.eval()
     running_loss = 0.0
-    correct, total = 0, 0
+    correct, total, total_for_flops = 0, 0, 0
     total_average_flops = cost_without_experts
     executed_expert_tokens = {name: 0 for name in token_expert_costs.keys()}
     total_expert_tokens = {name: 0 for name in token_expert_costs.keys()}
@@ -172,14 +172,16 @@ def online_evaluate_moe(accelerator: Accelerator,
             running_loss += loss.item()
             correct += (y_pred_max == y).sum().item()
             total += y.numel()  # use numel since targets can be batches of sequences
+            total_for_flops += y.size(0)  # for FLOPs calculations we care about per-sample average
             for moe_name in token_expert_costs.keys():
                 executed_expert_tokens[moe_name] += (gating_data[moe_name] > 0.0).long().sum().item()
                 total_expert_tokens[moe_name] += gating_data[moe_name].numel()
             if batches > 0 and batch == batches - 1:
                 break
     for moe_name, token_expert_cost in token_expert_costs.items():
-        expert_average_cost = executed_expert_tokens[moe_name] * token_expert_cost / total
-        logging.info(f'Averaged FLOPs for MoE {moe_name}: {expert_average_cost}')
+        expert_average_cost = executed_expert_tokens[moe_name] * token_expert_cost / total_for_flops
+        logging.info(f'Averaged FLOPs for MoE {moe_name}: {expert_average_cost}'
+                     f'({executed_expert_tokens[moe_name]} / {total_for_flops}')
         expert_average_costs[moe_name] = expert_average_cost
         total_average_flops += expert_average_cost
     # loss, acc
